@@ -63,6 +63,13 @@ impl std::fmt::Display for NodeStr<'_> {
     }
 }
 
+#[cfg(feature = "serde")]
+impl serde::Serialize for NodeStr<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self)
+    }
+}
+
 impl PartialEq for NodeStr<'_> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
@@ -112,14 +119,14 @@ impl From<CompactString> for NodeStr<'_> {
 /// vast majority of tag names and attribute keys which are protocol tokens.
 #[inline]
 fn intern_cow(s: &str) -> Cow<'static, str> {
-    if let Some(idx) = token::index_of_single_token(s)
-        && let Some(token) = token::get_single_token(idx)
-    {
-        return Cow::Borrowed(token);
-    } else if let Some((dict, idx)) = token::index_of_double_byte_token(s)
-        && let Some(token) = token::get_double_token(dict, idx)
-    {
-        return Cow::Borrowed(token);
+    if let Some(kind) = token::index_of_token(s) {
+        let interned = match kind {
+            token::TokenKind::Single(idx) => token::get_single_token(idx),
+            token::TokenKind::Double(dict, idx) => token::get_double_token(dict, idx),
+        };
+        if let Some(token) = interned {
+            return Cow::Borrowed(token);
+        }
     }
     Cow::Owned(s.to_string())
 }
@@ -266,6 +273,31 @@ impl From<&Jid> for NodeValue {
     }
 }
 
+macro_rules! impl_from_integer_for_nodevalue {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl From<$t> for NodeValue {
+                #[inline]
+                fn from(n: $t) -> Self {
+                    let mut buf = itoa::Buffer::new();
+                    NodeValue::String(CompactString::from(buf.format(n)))
+                }
+            }
+        )*
+    };
+}
+
+impl_from_integer_for_nodevalue!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
+);
+
+impl From<bool> for NodeValue {
+    #[inline]
+    fn from(b: bool) -> Self {
+        NodeValue::String(CompactString::from(if b { "true" } else { "false" }))
+    }
+}
+
 /// A collection of node attributes stored as key-value pairs.
 /// Uses a Vec internally for better cache locality with small attribute counts (typically 3-6).
 /// Values can be either strings or JIDs, avoiding stringification overhead for JID attributes.
@@ -376,7 +408,102 @@ impl FromIterator<(Cow<'static, str>, NodeValue)> for Attrs {
         Self(iter.into_iter().collect())
     }
 }
-pub type AttrsRef<'a> = Vec<(NodeStr<'a>, ValueRef<'a>)>;
+/// Covariant attribute container for decoded nodes.
+///
+/// Uses `Box<[T]>` (16 bytes: ptr + len) instead of `Vec<T>` (24 bytes: ptr + len + cap)
+/// or inline storage (which inflated NodeRef size). Zero-attr nodes skip allocation
+/// entirely. The boxed slice is allocated once with exact size from the decoder.
+///
+/// Covariant in `'a` (both Box and slices are covariant), compatible with yoke::Yokeable.
+#[derive(Debug, Clone)]
+pub enum AttrsRef<'a> {
+    Empty,
+    Slice(Box<[(NodeStr<'a>, ValueRef<'a>)]>),
+}
+
+impl PartialEq for AttrsRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<'a> AttrsRef<'a> {
+    /// Build from a pre-filled Vec. Preferred path from the decoder which
+    /// knows the exact attr count upfront.
+    pub fn from_vec(v: Vec<(NodeStr<'a>, ValueRef<'a>)>) -> Self {
+        if v.is_empty() {
+            Self::Empty
+        } else {
+            Self::Slice(v.into_boxed_slice())
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Slice(s) => s.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[(NodeStr<'a>, ValueRef<'a>)] {
+        match self {
+            Self::Empty => &[],
+            Self::Slice(s) => s,
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &(NodeStr<'a>, ValueRef<'a>)> {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a> FromIterator<(NodeStr<'a>, ValueRef<'a>)> for AttrsRef<'a> {
+    fn from_iter<I: IntoIterator<Item = (NodeStr<'a>, ValueRef<'a>)>>(iter: I) -> Self {
+        Self::from_vec(iter.into_iter().collect())
+    }
+}
+
+// Compile-time covariance check: if AttrsRef ever becomes invariant
+// (e.g. by adding a Cell or &mut), this function will fail to compile.
+fn _assert_attrs_ref_covariant<'short, 'long: 'short>(x: AttrsRef<'long>) -> AttrsRef<'short> {
+    x
+}
+
+// Safety: AttrsRef<'a> is covariant in 'a because:
+// - Empty carries no lifetime
+// - Slice(Box<[(NodeStr<'a>, ValueRef<'a>)]>): Box<[T]> is covariant in T,
+//   and (NodeStr<'a>, ValueRef<'a>) is covariant in 'a
+// The _assert_attrs_ref_covariant function above enforces this at compile time.
+unsafe impl<'a> yoke::Yokeable<'a> for AttrsRef<'static> {
+    type Output = AttrsRef<'a>;
+
+    fn transform(&'a self) -> &'a Self::Output {
+        self
+    }
+
+    fn transform_owned(self) -> Self::Output {
+        self
+    }
+
+    unsafe fn make(from: Self::Output) -> Self {
+        unsafe { std::mem::transmute(from) }
+    }
+
+    fn transform_mut<F>(&'a mut self, f: F)
+    where
+        F: 'static + for<'b> FnOnce(&'b mut Self::Output),
+    {
+        unsafe { f(std::mem::transmute::<&mut Self, &mut Self::Output>(self)) }
+    }
+}
 
 /// A decoded attribute value that can be either a string or a structured JID.
 /// This avoids string allocation when decoding JID tokens - the JidRef is returned
@@ -387,7 +514,30 @@ pub enum ValueRef<'a> {
     Jid(JidRef<'a>),
 }
 
+#[cfg(feature = "serde")]
+impl serde::Serialize for ValueRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ValueRef::String(s) => {
+                serializer.serialize_newtype_variant("NodeValue", 0, "String", &**s)
+            }
+            ValueRef::Jid(j) => serializer.serialize_newtype_variant("NodeValue", 1, "Jid", j),
+        }
+    }
+}
+
 impl<'a> ValueRef<'a> {
+    /// Encode this value directly to the binary encoder.
+    pub fn encode_value<W: crate::encoder::ByteWriter>(
+        &self,
+        encoder: &mut crate::encoder::Encoder<'_, W>,
+    ) -> crate::error::Result<()> {
+        match self {
+            ValueRef::String(s) => encoder.write_string(s),
+            ValueRef::Jid(jid) => encoder.write_jid_ref(jid),
+        }
+    }
+
     /// String view of the value. Borrows from `self`.
     /// - String variant: borrows the inner str — zero copy
     /// - Jid variant: Cow::Owned — allocates only when needed
@@ -448,7 +598,24 @@ pub enum NodeContent {
 pub enum NodeContentRef<'a> {
     Bytes(Cow<'a, [u8]>),
     String(NodeStr<'a>),
-    Nodes(Box<NodeVec<'a>>),
+    Nodes(Box<[NodeRef<'a>]>),
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for NodeContentRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            NodeContentRef::Bytes(b) => {
+                serializer.serialize_newtype_variant("NodeContent", 0, "Bytes", b.as_ref())
+            }
+            NodeContentRef::String(s) => {
+                serializer.serialize_newtype_variant("NodeContent", 1, "String", &**s)
+            }
+            NodeContentRef::Nodes(nodes) => {
+                serializer.serialize_newtype_variant("NodeContent", 2, "Nodes", &**nodes)
+            }
+        }
+    }
 }
 
 impl NodeContent {
@@ -458,7 +625,8 @@ impl NodeContent {
             NodeContent::Bytes(b) => NodeContentRef::Bytes(Cow::Borrowed(b)),
             NodeContent::String(s) => NodeContentRef::String(NodeStr::Borrowed(s.as_str())),
             NodeContent::Nodes(nodes) => {
-                NodeContentRef::Nodes(Box::new(nodes.iter().map(|n| n.as_node_ref()).collect()))
+                let v: Vec<_> = nodes.iter().map(|n| n.as_node_ref()).collect();
+                NodeContentRef::Nodes(v.into_boxed_slice())
             }
         }
     }
@@ -569,6 +737,32 @@ impl Node {
     }
 }
 
+/// Wrapper that serializes `AttrsRef` with the same newtype-struct framing
+/// that serde's derive produces for `Attrs(Vec<...>)`. Without this, binary
+/// formats (bincode, postcard, etc.) would see a bare sequence instead of a
+/// newtype struct wrapper.
+#[cfg(feature = "serde")]
+struct AttrsRefWrapper<'a, 'b>(&'b AttrsRef<'a>);
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for AttrsRefWrapper<'_, '_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_newtype_struct("Attrs", self.0.as_slice())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for NodeRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("Node", 3)?;
+        s.serialize_field("tag", &*self.tag)?;
+        s.serialize_field("attrs", &AttrsRefWrapper(&self.attrs))?;
+        s.serialize_field("content", &self.content)?;
+        s.end()
+    }
+}
+
 impl<'a> NodeRef<'a> {
     pub fn new(tag: NodeStr<'a>, attrs: AttrsRef<'a>, content: Option<NodeContentRef<'a>>) -> Self {
         Self {
@@ -584,7 +778,7 @@ impl<'a> NodeRef<'a> {
 
     pub fn children(&self) -> Option<&[NodeRef<'a>]> {
         match self.content.as_deref() {
-            Some(NodeContentRef::Nodes(nodes)) => Some(nodes.as_slice()),
+            Some(NodeContentRef::Nodes(nodes)) => Some(nodes),
             _ => None,
         }
     }
@@ -740,6 +934,21 @@ impl OwnedNodeRef {
         self.inner.get().to_owned()
     }
 
+    /// Return a zero-copy `Bytes` sub-view for a slice that borrows from this
+    /// node's backing buffer. Panics if `slice` does not point within the buffer.
+    pub fn slice_bytes(&self, slice: &[u8]) -> Bytes {
+        let cart = &self.inner.backing_cart().0;
+        let base = cart.as_ptr() as usize;
+        let end = base + cart.len();
+        let ptr = slice.as_ptr() as usize;
+        assert!(
+            ptr >= base && ptr + slice.len() <= end,
+            "slice is not within the backing buffer"
+        );
+        let offset = ptr - base;
+        cart.slice(offset..offset + slice.len())
+    }
+
     /// The tag name of this node.
     #[inline]
     pub fn tag(&self) -> &str {
@@ -810,8 +1019,116 @@ impl OwnedNodeRef {
     }
 }
 
+#[cfg(feature = "serde")]
+impl serde::Serialize for OwnedNodeRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.get().serialize(serializer)
+    }
+}
+
 impl std::fmt::Debug for OwnedNodeRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.inner.get().fmt(f)
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "serde")]
+mod serde_tests {
+    use super::*;
+    use crate::jid::{Jid, Server};
+
+    #[test]
+    fn node_ref_serializes_same_as_node() {
+        let node = Node::new(
+            Cow::Borrowed("message"),
+            Attrs(vec![
+                (Cow::Borrowed("type"), NodeValue::String("text".into())),
+                (Cow::Borrowed("from"), NodeValue::Jid(Jid::pn("5550199999"))),
+            ]),
+            Some(NodeContent::String("hello".into())),
+        );
+        let node_ref = node.as_node_ref();
+
+        let owned_json = serde_json::to_value(&node).unwrap();
+        let ref_json = serde_json::to_value(&node_ref).unwrap();
+        assert_eq!(owned_json, ref_json);
+    }
+
+    #[test]
+    fn nested_nodes_serialize_same() {
+        let child = Node::new(Cow::Borrowed("item"), Attrs::new(), None);
+        let parent = Node::new(
+            Cow::Borrowed("list"),
+            Attrs::new(),
+            Some(NodeContent::Nodes(vec![child])),
+        );
+        let parent_ref = parent.as_node_ref();
+
+        assert_eq!(
+            serde_json::to_value(&parent).unwrap(),
+            serde_json::to_value(&parent_ref).unwrap(),
+        );
+    }
+
+    #[test]
+    fn bytes_content_serializes_same() {
+        let node = Node::new(
+            Cow::Borrowed("iq"),
+            Attrs(vec![(Cow::Borrowed("id"), NodeValue::String("1".into()))]),
+            Some(NodeContent::Bytes(vec![0xDE, 0xAD])),
+        );
+        let node_ref = node.as_node_ref();
+
+        let owned_json = serde_json::to_value(&node).unwrap();
+        let ref_json = serde_json::to_value(&node_ref).unwrap();
+        assert_eq!(owned_json, ref_json);
+    }
+
+    #[test]
+    fn value_ref_matches_node_value() {
+        let string_val = NodeValue::String("hello".into());
+        let string_ref = ValueRef::String(NodeStr::Borrowed("hello"));
+        assert_eq!(
+            serde_json::to_value(&string_val).unwrap(),
+            serde_json::to_value(&string_ref).unwrap(),
+        );
+
+        let jid = Jid {
+            user: "5550199999".into(),
+            server: Server::Group,
+            agent: 1,
+            device: 2,
+            integrator: 3,
+        };
+        let jid_val = NodeValue::Jid(jid.clone());
+        let jid_ref_val = ValueRef::Jid(JidRef {
+            user: NodeStr::Borrowed("5550199999"),
+            server: Server::Group,
+            agent: 1,
+            device: 2,
+            integrator: 3,
+        });
+        assert_eq!(
+            serde_json::to_value(&jid_val).unwrap(),
+            serde_json::to_value(&jid_ref_val).unwrap(),
+        );
+    }
+
+    #[test]
+    fn owned_node_ref_serializes_same_as_owned() {
+        let node = Node::new(
+            Cow::Borrowed("iq"),
+            Attrs(vec![(Cow::Borrowed("id"), NodeValue::String("abc".into()))]),
+            Some(NodeContent::String("payload".into())),
+        );
+
+        let bytes = crate::marshal::marshal(&node).unwrap();
+        // marshal writes a leading format byte that unmarshal_ref doesn't expect
+        let owned_ref = OwnedNodeRef::new(Bytes::from(bytes[1..].to_vec())).unwrap();
+
+        let from_ref = serde_json::to_value(&owned_ref).unwrap();
+        let from_owned = serde_json::to_value(owned_ref.to_owned_node()).unwrap();
+        assert_eq!(from_ref, from_owned);
     }
 }

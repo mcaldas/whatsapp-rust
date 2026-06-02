@@ -1,17 +1,17 @@
 use crate::error::{BinaryError, Result};
-use crate::jid::JidRef;
-use crate::node::{AttrsRef, NodeContentRef, NodeRef, NodeStr, NodeVec, ValueRef};
+use crate::jid::{JidRef, push_jid_to_compact};
+use crate::node::{AttrsRef, NodeContentRef, NodeRef, NodeStr, ValueRef};
 use crate::token;
 use compact_str::CompactString;
 use std::borrow::Cow;
-use std::fmt::Write;
 #[cfg(feature = "simd")]
 use std::simd::{Simd, prelude::*, u8x16};
 
-/// Format a JidRef directly into CompactString, avoiding the intermediate String.
+/// Format a JidRef directly into CompactString using direct push operations,
+/// bypassing `fmt::Display` and `dyn Write` dispatch entirely.
 fn jid_ref_to_compact(j: &JidRef<'_>) -> CompactString {
-    let mut s = CompactString::default();
-    write!(s, "{}", j).expect("JidRef Display cannot fail");
+    let mut s = CompactString::with_capacity(j.user.len() + 20);
+    push_jid_to_compact(&j.user, j.server, j.agent, j.device, &mut s);
     s
 }
 
@@ -425,7 +425,10 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_attributes(&mut self, size: usize) -> Result<AttrsRef<'a>> {
-        let mut attrs = AttrsRef::with_capacity(size);
+        if size == 0 {
+            return Ok(AttrsRef::Empty);
+        }
+        let mut v = Vec::with_capacity(size);
         for _ in 0..size {
             let key = self
                 .read_value_as_string()?
@@ -433,9 +436,9 @@ impl<'a> Decoder<'a> {
             let value = self
                 .read_value()?
                 .unwrap_or(ValueRef::String(NodeStr::Borrowed("")));
-            attrs.push((key, value));
+            v.push((key, value));
         }
-        Ok(attrs)
+        Ok(AttrsRef::from_vec(v))
     }
 
     fn read_content(&mut self) -> Result<Option<NodeContentRef<'a>>> {
@@ -450,11 +453,11 @@ impl<'a> Decoder<'a> {
 
             token::LIST_8 | token::LIST_16 => {
                 let size = self.read_list_size(tag)?;
-                let mut nodes = NodeVec::with_capacity(size);
+                let mut nodes = Vec::with_capacity(size);
                 for _ in 0..size {
                     nodes.push(self.read_node_ref()?);
                 }
-                Ok(Some(NodeContentRef::Nodes(Box::new(nodes))))
+                Ok(Some(NodeContentRef::Nodes(nodes.into_boxed_slice())))
             }
 
             token::BINARY_8 => {

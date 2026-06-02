@@ -8,10 +8,8 @@
 //! - Parsing the notification node
 //!
 //! Reference: WAWebCryptoMediaRetry, WAWebSendServerErrorReceiptJob,
-//! WAWebHandleMediaRetryNotification (docs/captured-js/).
+//! WAWebHandleMediaRetryNotification.
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Result, anyhow};
 use hkdf::Hkdf;
 use prost::Message;
@@ -20,6 +18,7 @@ use sha2::Sha256;
 use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeContentRef, NodeRef};
+use wacore_libsignal::crypto::{aes_256_gcm_decrypt, aes_256_gcm_encrypt};
 use waproto::whatsapp as wa;
 
 const MEDIA_RETRY_HKDF_INFO: &str = "WhatsApp Media Retry Notification";
@@ -66,8 +65,6 @@ pub fn encrypt_media_retry_receipt(
     stanza_id: &str,
 ) -> Result<(Vec<u8>, [u8; ENC_IV_SIZE])> {
     let key = derive_media_retry_key(media_key)?;
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|e| anyhow!("AES-GCM key init failed: {e}"))?;
 
     let mut iv = [0u8; ENC_IV_SIZE];
     rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
@@ -77,15 +74,8 @@ pub fn encrypt_media_retry_receipt(
     };
     let plaintext = receipt.encode_to_vec();
 
-    let nonce = Nonce::from_slice(&iv);
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: &plaintext,
-                aad: stanza_id.as_bytes(),
-            },
-        )
+    let mut ciphertext = Vec::with_capacity(plaintext.len() + 16);
+    aes_256_gcm_encrypt(&key, &iv, stanza_id.as_bytes(), &plaintext, &mut ciphertext)
         .map_err(|e| anyhow!("AES-GCM encrypt failed: {e}"))?;
 
     Ok((ciphertext, iv))
@@ -101,19 +91,17 @@ pub fn decrypt_media_retry_notification(
     ciphertext: &[u8],
 ) -> Result<wa::MediaRetryNotification> {
     let key = derive_media_retry_key(media_key)?;
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|e| anyhow!("AES-GCM key init failed: {e}"))?;
+    let nonce: &[u8; 12] = iv.try_into().map_err(|_| anyhow!("Invalid IV length"))?;
 
-    let nonce = Nonce::from_slice(iv);
-    let plaintext = cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: ciphertext,
-                aad: stanza_id.as_bytes(),
-            },
-        )
-        .map_err(|e| anyhow!("AES-GCM decrypt failed: {e}"))?;
+    let mut plaintext = Vec::with_capacity(ciphertext.len().saturating_sub(16));
+    aes_256_gcm_decrypt(
+        &key,
+        nonce,
+        stanza_id.as_bytes(),
+        ciphertext,
+        &mut plaintext,
+    )
+    .map_err(|e| anyhow!("AES-GCM decrypt failed: {e}"))?;
 
     wa::MediaRetryNotification::decode(plaintext.as_slice())
         .map_err(|e| anyhow!("protobuf decode failed: {e}"))
@@ -150,7 +138,7 @@ pub fn build_media_retry_receipt(
 
     let mut rmr_builder = NodeBuilder::new("rmr")
         .attr("jid", chat_jid)
-        .attr("from_me", is_from_me.to_string());
+        .attr("from_me", is_from_me);
 
     if let Some(p) = participant {
         rmr_builder = rmr_builder.attr("participant", p);
@@ -161,6 +149,34 @@ pub fn build_media_retry_receipt(
         .attr("to", own_jid)
         .attr("id", msg_id)
         .children([encrypt_node, rmr_builder.build()])
+        .build()
+}
+
+/// Build the `<receipt type="server-error" category="peer">` node that asks the
+/// phone to re-upload a history-sync blob whose download failed.
+///
+/// WA Web: `WAWebSendHistSyncServerErrorReceiptJob`. Differs from the media
+/// retry receipt: it carries `category="peer"`, targets our own JID, and omits
+/// the `<rmr>` child. The encrypted payload reuses [`encrypt_media_retry_receipt`].
+pub fn build_history_sync_server_error_receipt(
+    own_jid: &Jid,
+    msg_id: &str,
+    ciphertext: &[u8],
+    iv: &[u8],
+) -> Node {
+    let encrypt_node = NodeBuilder::new("encrypt")
+        .children([
+            NodeBuilder::new("enc_p").bytes(ciphertext.to_vec()).build(),
+            NodeBuilder::new("enc_iv").bytes(iv.to_vec()).build(),
+        ])
+        .build();
+
+    NodeBuilder::new("receipt")
+        .attr("type", "server-error")
+        .attr("to", own_jid)
+        .attr("id", msg_id)
+        .attr("category", "peer")
+        .children([encrypt_node])
         .build()
 }
 
@@ -317,5 +333,34 @@ mod tests {
 
         let rmr = node.get_optional_child_by_tag(&["rmr"]).unwrap();
         assert!(rmr.attrs().optional_string("participant").is_some());
+    }
+
+    #[test]
+    fn build_history_sync_receipt_structure() {
+        let own_jid = Jid::pn("1234567890");
+        let (ciphertext, iv) = encrypt_media_retry_receipt(&[2u8; 32], "HS1").unwrap();
+
+        let node = build_history_sync_server_error_receipt(&own_jid, "HS1", &ciphertext, &iv);
+
+        assert_eq!(node.tag.as_ref(), "receipt");
+        assert_eq!(
+            node.attrs().optional_string("type").unwrap().as_ref(),
+            "server-error"
+        );
+        assert_eq!(
+            node.attrs().optional_string("category").unwrap().as_ref(),
+            "peer"
+        );
+        assert_eq!(node.attrs().optional_string("id").unwrap().as_ref(), "HS1");
+        assert_eq!(
+            node.attrs().optional_string("to").unwrap().as_ref(),
+            own_jid.to_string()
+        );
+
+        let encrypt = node.get_optional_child_by_tag(&["encrypt"]).unwrap();
+        assert!(encrypt.get_optional_child_by_tag(&["enc_p"]).is_some());
+        assert!(encrypt.get_optional_child_by_tag(&["enc_iv"]).is_some());
+        // The history-sync variant carries no <rmr> child.
+        assert!(node.get_optional_child_by_tag(&["rmr"]).is_none());
     }
 }

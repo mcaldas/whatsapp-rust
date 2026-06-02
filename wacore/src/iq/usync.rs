@@ -50,7 +50,7 @@
 //! </iq>
 //! ```
 
-use crate::StringEnum;
+use crate::WireEnum;
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;
 use anyhow::anyhow;
@@ -61,29 +61,29 @@ use wacore_binary::{Jid, Server};
 use wacore_binary::{Node, NodeContent, NodeContentRef, NodeRef};
 
 /// Usync mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StringEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
 pub enum UsyncMode {
     /// Query mode - used for contact lookups.
-    #[string_default]
-    #[str = "query"]
+    #[wire_default]
+    #[wire = "query"]
     Query,
     /// Full mode - used for user info with more details.
-    #[str = "full"]
+    #[wire = "full"]
     Full,
 }
 
 /// Usync context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StringEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
 pub enum UsyncContext {
     /// Interactive context - for user-initiated operations.
-    #[string_default]
-    #[str = "interactive"]
+    #[wire_default]
+    #[wire = "interactive"]
     Interactive,
     /// Background context - for background sync operations.
-    #[str = "background"]
+    #[wire = "background"]
     Background,
     /// Message context - for message-related operations.
-    #[str = "message"]
+    #[wire = "message"]
     Message,
 }
 
@@ -91,7 +91,7 @@ pub enum UsyncContext {
 pub struct IsOnWhatsAppUser {
     pub jid: Jid,
     /// Helps server optimize the lookup (WA Web pre-populates this from its LID cache).
-    pub known_lid: Option<String>,
+    pub known_lid: Option<wacore_binary::CompactString>,
 }
 
 fn build_user_nodes(users: &[IsOnWhatsAppUser]) -> Vec<Node> {
@@ -106,7 +106,11 @@ fn build_user_nodes(users: &[IsOnWhatsAppUser]) -> Vec<Node> {
                 };
                 let mut children = vec![NodeBuilder::new("contact").string_content(phone).build()];
                 if let Some(lid) = &user.known_lid {
-                    children.push(NodeBuilder::new("lid").attr("jid", Jid::lid(lid)).build());
+                    children.push(
+                        NodeBuilder::new("lid")
+                            .attr("jid", Jid::lid(lid.as_str()))
+                            .build(),
+                    );
                 }
                 NodeBuilder::new("user").children(children).build()
             } else {
@@ -488,6 +492,12 @@ pub struct DeviceListResponse {
 pub struct DeviceListSpec {
     pub jids: Vec<Jid>,
     pub sid: String,
+    /// Optional per-user device-list hint `(device_hash, ts)`, keyed by the bare
+    /// (`to_non_ad`) jid. When present, the query emits
+    /// `<user jid="..."><devices device_hash="2:.." ts="N"/></user>` so the server
+    /// returns only CHANGED users (WA Web `syncDeviceList`). Users the server omits
+    /// from the response are UNCHANGED and their cached devices must be preserved.
+    pub hashes: std::collections::HashMap<Jid, (String, i64)>,
 }
 
 impl DeviceListSpec {
@@ -495,6 +505,21 @@ impl DeviceListSpec {
         Self {
             jids,
             sid: sid.into(),
+            hashes: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Like [`new`](Self::new) but carries per-user `device_hash`/`ts` hints so the
+    /// server can skip unchanged users. Keys are bare (`to_non_ad`) jids.
+    pub fn with_hashes(
+        jids: Vec<Jid>,
+        sid: impl Into<String>,
+        hashes: std::collections::HashMap<Jid, (String, i64)>,
+    ) -> Self {
+        Self {
+            jids,
+            sid: sid.into(),
+            hashes,
         }
     }
 }
@@ -513,9 +538,17 @@ impl IqSpec for DeviceListSpec {
             .jids
             .iter()
             .map(|jid| {
-                NodeBuilder::new("user")
-                    .attr("jid", jid.to_non_ad())
-                    .build()
+                let bare = jid.to_non_ad();
+                let mut builder = NodeBuilder::new("user").attr("jid", bare.clone());
+                // WA Web sends the cached per-user device list hash so the server
+                // can answer "unchanged" by omitting the user from the response.
+                if let Some((device_hash, ts)) = self.hashes.get(&bare) {
+                    builder = builder.children([NodeBuilder::new("devices")
+                        .attr("device_hash", device_hash.as_str())
+                        .attr("ts", ts.to_string())
+                        .build()]);
+                }
+                builder.build()
             })
             .collect();
 
@@ -826,7 +859,7 @@ mod tests {
         let spec = IsOnWhatsAppSpec::new(
             vec![IsOnWhatsAppUser {
                 jid: Jid::pn("1234567890"),
-                known_lid: Some("100000001".to_string()),
+                known_lid: Some("100000001".into()),
             }],
             "sid",
             IsOnWhatsAppQueryType::Pn,
@@ -1037,9 +1070,85 @@ mod tests {
             let query = usync.get_optional_child("query").unwrap();
             let devices = query.get_optional_child("devices").unwrap();
             assert!(devices.attrs.get("version").is_some_and(|s| s == "2"));
+
+            // Without a hint, the <user> node is bare (no per-user <devices>).
+            let user = usync
+                .get_optional_child("list")
+                .unwrap()
+                .get_optional_child("user")
+                .unwrap();
+            assert!(user.get_optional_child("devices").is_none());
         } else {
             panic!("Expected NodeContent::Nodes");
         }
+    }
+
+    #[test]
+    fn test_device_list_spec_build_iq_with_device_hash() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let mut hashes = std::collections::HashMap::new();
+        hashes.insert(jid.clone(), ("2:cachedhash".to_string(), 1_700_000_000i64));
+        let spec = DeviceListSpec::with_hashes(vec![jid], "sid-h", hashes);
+        let iq = spec.build_iq();
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("Expected NodeContent::Nodes");
+        };
+        let usync = &nodes[0];
+        // Query-level <devices version="2"> still declares the protocol.
+        let query = usync.get_optional_child("query").unwrap();
+        assert!(
+            query
+                .get_optional_child("devices")
+                .unwrap()
+                .attrs
+                .get("version")
+                .is_some_and(|s| s == "2")
+        );
+        // Per-user <devices device_hash ts> carries the cached hash.
+        let user = usync
+            .get_optional_child("list")
+            .unwrap()
+            .get_optional_child("user")
+            .unwrap();
+        let dev = user.get_optional_child("devices").unwrap();
+        assert!(
+            dev.attrs
+                .get("device_hash")
+                .is_some_and(|s| s == "2:cachedhash")
+        );
+        assert!(dev.attrs.get("ts").is_some_and(|s| s == "1700000000"));
+    }
+
+    #[test]
+    fn test_device_list_spec_parse_omits_unchanged_user() {
+        // Queried two users; the server returns only one (the other unchanged →
+        // omitted). The parser must yield only the present user so the caller
+        // keeps the omitted user's cached devices (device_hash merge-safety).
+        let a: Jid = "1111111111@s.whatsapp.net".parse().unwrap();
+        let b: Jid = "2222222222@s.whatsapp.net".parse().unwrap();
+        let spec = DeviceListSpec::new(vec![a, b], "sid-omit");
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "1111111111@s.whatsapp.net")
+                        .children([NodeBuilder::new("devices")
+                            .children([NodeBuilder::new("device-list")
+                                .attr("hash", "2:hashA")
+                                .children([NodeBuilder::new("device").attr("id", "0").build()])
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(result.device_lists.len(), 1, "omitted user must not appear");
+        assert_eq!(result.device_lists[0].user.user, "1111111111");
     }
 
     #[test]

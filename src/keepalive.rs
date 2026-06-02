@@ -31,9 +31,12 @@ enum KeepaliveResult {
 fn classify_keepalive_error(e: &IqError) -> KeepaliveResult {
     match e {
         IqError::Socket(_)
+        | IqError::EncryptSend(_)
+        | IqError::ClientState(_)
         | IqError::Disconnected(_)
         | IqError::NotConnected
-        | IqError::InternalChannelClosed => KeepaliveResult::FatalFailure,
+        | IqError::InternalChannelClosed
+        | IqError::EncodeError(_) => KeepaliveResult::FatalFailure,
         // Exhaustive: forces a compile error when new IqError variants are added
         // so the developer must decide the classification.
         IqError::Timeout | IqError::ServerError { .. } | IqError::ParseError(_) => {
@@ -62,19 +65,22 @@ impl Client {
 
         debug!(target: "Client/Keepalive", "Sending keepalive ping");
 
+        // wall_rtt_ms feeds the WA Web onClockSkewUpdate formula, which
+        // mixes start_ms with serverTime — both halves must be wall-clock.
+        // rtt_monotonic is for the log only.
         let start_ms = wacore::time::now_millis();
+        let rtt_start = wacore::time::Instant::now();
         let iq = wacore::iq::keepalive::KeepaliveSpec::with_timeout(KEEP_ALIVE_RESPONSE_DEADLINE)
             .build_iq();
         match self.send_iq(iq).await {
             Ok(response_node) => {
-                let end_ms = wacore::time::now_millis();
-                let rtt_ms = end_ms - start_ms;
-                debug!(target: "Client/Keepalive", "Received keepalive pong (RTT: {rtt_ms}ms)");
-                // WA Web: onClockSkewUpdate — Math.round((startTime + rtt/2) / 1000 - serverTime)
+                let rtt_monotonic = rtt_start.elapsed();
+                let wall_rtt_ms = wacore::time::now_millis().saturating_sub(start_ms).max(0);
+                debug!(target: "Client/Keepalive", "Received keepalive pong (RTT: {rtt_monotonic:.2?})");
                 self.unified_session.update_server_time_offset_with_rtt(
                     response_node.get(),
                     start_ms,
-                    rtt_ms,
+                    wall_rtt_ms,
                 );
                 KeepaliveResult::Ok
             }
@@ -90,11 +96,15 @@ impl Client {
         let mut error_count = 0u32;
         let mut cleanup_counter = 0u32;
         let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
+        // Capture the per-connection signal once — re-subscribing each iteration
+        // would let a racing reset_connection_shutdown swap the underlying
+        // notifier mid-loop and strand this task on the next connection's signal.
+        let shutdown_signal = self.connection_shutdown_signal();
 
         loop {
-            // Register the shutdown listener BEFORE calculating the sleep
-            // duration so we never miss a notification between loop iterations.
-            let shutdown = self.shutdown_notifier.listen();
+            // Fresh listener each iteration (event_listener is edge-triggered);
+            // the Weak underneath stays pinned to this connection's notifier.
+            let shutdown = wacore::runtime::wait_for_shutdown(&shutdown_signal);
 
             let interval_ms = rand::make_rng::<rand::rngs::StdRng>().random_range(
                 KEEP_ALIVE_INTERVAL_MIN.as_millis()..=KEEP_ALIVE_INTERVAL_MAX.as_millis(),
@@ -106,6 +116,15 @@ impl Client {
                     if !self.is_connected() {
                         debug!(target: "Client/Keepalive", "Not connected, exiting keepalive loop.");
                         return;
+                    }
+
+                    // Periodic DB retention (~every 12 ticks ≈ 5 min). Driven by
+                    // the interval tick itself, BEFORE the idle-ping early-return,
+                    // so busy connections (which skip the ping) still prune.
+                    cleanup_counter += 1;
+                    if cleanup_counter >= 12 {
+                        cleanup_counter = 0;
+                        self.spawn_retention_cleanup(sent_msg_ttl);
                     }
 
                     let last_recv = self.last_data_received_ms.load(Ordering::Relaxed);
@@ -137,20 +156,6 @@ impl Client {
                                 debug!(target: "Client/Keepalive", "Keepalive restored after {error_count} failure(s).");
                             }
                             error_count = 0;
-
-                            // Periodic cleanup of expired sent messages (~every 12 ticks ≈ 5 min)
-                            cleanup_counter += 1;
-                            if sent_msg_ttl > 0 && cleanup_counter >= 12 {
-                                cleanup_counter = 0;
-                                let backend = self.persistence_manager.backend();
-                                let cutoff = wacore::time::now_secs()
-                                    - sent_msg_ttl as i64;
-                                self.runtime.spawn(Box::pin(async move {
-                                    if let Err(e) = backend.delete_expired_sent_messages(cutoff).await {
-                                        log::debug!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
-                                    }
-                                })).detach();
-                            }
                         }
                         KeepaliveResult::FatalFailure => {
                             debug!(target: "Client/Keepalive", "Fatal keepalive failure, exiting loop.");
@@ -186,6 +191,47 @@ impl Client {
                     return;
                 }
             }
+        }
+    }
+
+    /// Fire-and-forget DB retention sweeps. Each TTL gates its own delete so
+    /// they enable/disable independently. `0` disables a sweep. TTLs are
+    /// converted with a checked cast (absurd values clamp instead of wrapping
+    /// the cutoff negative).
+    fn spawn_retention_cleanup(&self, sent_msg_ttl: u64) {
+        let now = wacore::time::now_secs();
+        let cutoff_for = |ttl: u64| now.saturating_sub(i64::try_from(ttl).unwrap_or(i64::MAX));
+
+        if sent_msg_ttl > 0 {
+            let backend = self.persistence_manager.backend();
+            let cutoff = cutoff_for(sent_msg_ttl);
+            self.runtime
+                .spawn(Box::pin(async move {
+                    if let Err(e) = backend.delete_expired_sent_messages(cutoff).await {
+                        log::debug!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
+                    }
+                }))
+                .detach();
+        }
+
+        // msg_secrets retention: prune rows whose per-row deadline has passed.
+        // expires_at is absolute, so the cutoff is simply "now"; per-kind
+        // horizons and never-expire (0) rows are baked in at write time.
+        if self.cache_config.msg_secret_policy.prunes() {
+            let backend = self.persistence_manager.backend();
+            self.runtime
+                .spawn(Box::pin(async move {
+                    match backend.delete_expired_msg_secrets(now).await {
+                        Ok(n) if n > 0 => {
+                            log::debug!(target: "Client/Keepalive", "Pruned {n} expired msg_secrets");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::debug!(target: "Client/Keepalive", "msg_secrets cleanup error: {e}");
+                        }
+                    }
+                }))
+                .detach();
         }
     }
 }
@@ -224,7 +270,7 @@ mod tests {
     #[test]
     fn test_classify_socket_error_is_fatal() {
         assert_eq!(
-            classify_keepalive_error(&IqError::Socket(SocketError::Crypto("test".to_string()))),
+            classify_keepalive_error(&IqError::Socket(SocketError::SocketClosed)),
             KeepaliveResult::FatalFailure,
         );
     }

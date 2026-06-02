@@ -6,6 +6,7 @@ use crate::cache::Cache;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::cache_store::TypedCache;
+pub use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, OriginalMessageResolver};
 pub use wacore::store::cache::CacheStore;
 
 /// Configuration for a single cache instance.
@@ -159,23 +160,32 @@ impl CacheStores {
 pub struct CacheConfig {
     /// Group metadata cache (time_to_live). Default: 1h TTL, 250 entries.
     pub group_cache: CacheEntryConfig,
-    /// Device registry cache (time_to_live). Default: 1h TTL, 5000 entries.
+    /// Device registry cache (time_to_live). Default: 1h TTL, 1000 entries.
     pub device_registry_cache: CacheEntryConfig,
-    /// LID-to-phone cache (time_to_idle). Default: 1h timeout, 10000 entries.
+    /// LID-to-phone cache. WAWebLidPnCache uses plain Maps with no expiry
+    /// and no size cap; evicting a still-valid mapping silently downgrades
+    /// Signal addresses to `@c.us`. Default: no timeout, capacity u64::MAX
+    /// (effectively unbounded — moka doesn't expose an `unbounded()` builder).
     pub lid_pn_cache: CacheEntryConfig,
-    /// Retried group messages tracker (time_to_live). Default: 5m TTL, 2000 entries.
-    pub retried_group_messages: CacheEntryConfig,
     /// Optional L1 in-memory cache for sent messages (retry support).
     /// Default: capacity 0 (disabled — DB-only, matching WA Web).
     /// Set capacity > 0 to enable a fast in-memory cache in front of the DB.
     pub recent_messages: CacheEntryConfig,
-    /// Message retry counts (time_to_live). Default: 5m TTL, 1000 entries.
+    /// Message retry counts (time_to_live). Default: 1h TTL, 500 entries.
+    /// Long enough that the MAX_DECRYPT_RETRIES cap survives spaced redeliveries.
     pub message_retry_counts: CacheEntryConfig,
-    /// PDO pending requests (time_to_live). Default: 30s TTL, 500 entries.
+    /// Dedup key for `UndecryptableMessage` dispatch so a server resend of
+    /// the same id does not surface a second notification. Default: 5m TTL,
+    /// 1000 entries.
+    pub undecryptable_dispatched: CacheEntryConfig,
+    /// PDO pending requests (time_to_live). Default: 30s TTL, 200 entries.
     pub pdo_pending_requests: CacheEntryConfig,
     /// Sender key device tracking cache (time_to_idle). Default: 1h TTI, 500 entries.
     /// Caches per-group SKDM distribution state to avoid DB reads on every group send.
     pub sender_key_devices_cache: CacheEntryConfig,
+    /// Session-recreate throttle history (time_to_live). Default: 1h TTL, 256
+    /// entries. Replaces a global `Mutex<HashMap>` scanned O(n) per retry receipt.
+    pub session_recreate_history: CacheEntryConfig,
 
     // --- Coordination caches (capacity-only, no TTL) ---
     /// Per-device Signal session lock capacity. Default: 10000.
@@ -184,9 +194,46 @@ pub struct CacheConfig {
     pub chat_lanes_capacity: u64,
 
     // --- Sent message DB cleanup ---
-    /// TTL in seconds for sent messages in DB before periodic cleanup.
-    /// 0 = no automatic cleanup. Default: 300 (5 minutes).
+    /// TTL in seconds for sent messages in DB before periodic cleanup. Must
+    /// outlive retry receipts (which can arrive well after a send) or the retry
+    /// is dropped as "not found in cache". The periodic sweep keeps the table
+    /// bounded. 0 = no automatic cleanup. Default: 7200 (2 hours).
     pub sent_message_ttl_secs: u64,
+
+    // --- MsgSecret retention ---
+    /// How the per-message `messageSecret` store is managed (capture / seed /
+    /// prune). Default [`MsgSecretPolicy::Managed`] bounds DB growth: it seeds
+    /// only the still-relevant slice of history and prunes by a per-add-on-kind
+    /// event-time horizon. Set [`MsgSecretPolicy::Full`] to keep everything
+    /// forever, or [`MsgSecretPolicy::Disabled`] to persist nothing and delegate
+    /// to [`original_message_resolver`].
+    ///
+    /// [`original_message_resolver`]: CacheConfig::original_message_resolver
+    pub msg_secret_policy: MsgSecretPolicy,
+    /// Per-add-on-kind retention horizons applied under `Managed`/`BotOnly`.
+    pub msg_secret_retention: MsgSecretRetention,
+    /// Whether to seed `messageSecret`s from history-sync blobs. Default `true`.
+    ///
+    /// Independent of live capture (which `msg_secret_policy` governs): seeding
+    /// only matters for add-ons that arrive live after connect yet reference a
+    /// parent delivered via history sync — edits of just-pre-pairing messages,
+    /// add-options/edits on still-open polls, or replays to a reconnecting
+    /// offline device. Headless consumers that only react to new messages can
+    /// set this to `false` to skip the pairing-time seed entirely. When `true`,
+    /// the policy still filters the seed (age/type under `Managed`, bot-only
+    /// under `BotOnly`, everything under `Full`).
+    pub seed_msg_secrets_from_history: bool,
+    /// Optional app-supplied fallback consulted when an add-on's parent secret
+    /// is absent from the store (and its LID/PN alternates). Lets an app that
+    /// keeps its own message store own secret retention; required for the
+    /// `Disabled` policy to decrypt anything beyond what it has seen live.
+    pub original_message_resolver: Option<Arc<dyn OriginalMessageResolver>>,
+    /// Bound on each [`original_message_resolver`] call. The resolver runs
+    /// inside the per-chat receive lane, so a slow callback would stall that
+    /// chat; on timeout the lookup degrades to a miss. Default: 5s.
+    ///
+    /// [`original_message_resolver`]: CacheConfig::original_message_resolver
+    pub msg_secret_resolver_timeout: Duration,
 
     // --- Custom store overrides ---
     /// Per-cache custom store overrides.
@@ -208,14 +255,29 @@ impl std::fmt::Debug for CacheConfig {
             .field("group_cache", &self.group_cache)
             .field("device_registry_cache", &self.device_registry_cache)
             .field("lid_pn_cache", &self.lid_pn_cache)
-            .field("retried_group_messages", &self.retried_group_messages)
             .field("recent_messages", &self.recent_messages)
             .field("message_retry_counts", &self.message_retry_counts)
+            .field("undecryptable_dispatched", &self.undecryptable_dispatched)
             .field("pdo_pending_requests", &self.pdo_pending_requests)
             .field("sender_key_devices_cache", &self.sender_key_devices_cache)
+            .field("session_recreate_history", &self.session_recreate_history)
             .field("session_locks_capacity", &self.session_locks_capacity)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
+            .field("msg_secret_policy", &self.msg_secret_policy)
+            .field("msg_secret_retention", &self.msg_secret_retention)
+            .field(
+                "seed_msg_secrets_from_history",
+                &self.seed_msg_secrets_from_history,
+            )
+            .field(
+                "original_message_resolver",
+                &self.original_message_resolver.is_some(),
+            )
+            .field(
+                "msg_secret_resolver_timeout",
+                &self.msg_secret_resolver_timeout,
+            )
             .field(
                 "cache_stores.group_cache",
                 &self.cache_stores.group_cache.is_some(),
@@ -239,20 +301,50 @@ impl Default for CacheConfig {
 
         Self {
             group_cache: CacheEntryConfig::new(one_hour, 250),
-            device_registry_cache: CacheEntryConfig::new(one_hour, 5_000),
-            lid_pn_cache: CacheEntryConfig::new(one_hour, 10_000),
-            retried_group_messages: CacheEntryConfig::new(five_min, 2_000),
+            device_registry_cache: CacheEntryConfig::new(one_hour, 1_000),
+            lid_pn_cache: CacheEntryConfig::new(None, u64::MAX),
             recent_messages: CacheEntryConfig::new(five_min, 0),
-            message_retry_counts: CacheEntryConfig::new(five_min, 1_000),
-            pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 500),
+            // 1h so the MAX_DECRYPT_RETRIES cap survives spaced redeliveries; a
+            // 5m TTL expired between reconnects so the count never reached the cap.
+            message_retry_counts: CacheEntryConfig::new(one_hour, 500),
+            undecryptable_dispatched: CacheEntryConfig::new(five_min, 1_000),
+            pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 200),
             sender_key_devices_cache: CacheEntryConfig::new(one_hour, 500),
+            session_recreate_history: CacheEntryConfig::new(one_hour, 256),
             // Coordination caches hold live mutexes/senders; capacity eviction
             // while a reference is held creates a second lock for the same key,
             // breaking serialization. Size generously to avoid eviction pressure.
             session_locks_capacity: 10_000,
             chat_lanes_capacity: 5_000,
-            sent_message_ttl_secs: 300,
+            sent_message_ttl_secs: 7200,
+            // Bounded by default: seed only the still-relevant slice of history
+            // and prune by per-add-on-kind event-time horizons, so the store no
+            // longer accumulates a secret for every message forever.
+            msg_secret_policy: MsgSecretPolicy::default(),
+            msg_secret_retention: MsgSecretRetention::default(),
+            seed_msg_secrets_from_history: true,
+            original_message_resolver: None,
+            msg_secret_resolver_timeout: Duration::from_secs(5),
             cache_stores: CacheStores::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lid_pn_cache_default_is_effectively_unbounded() {
+        let cfg = CacheConfig::default();
+        assert_eq!(
+            cfg.lid_pn_cache.timeout, None,
+            "lid_pn_cache must not expire entries by time; WAWebLidPnCache uses plain Maps"
+        );
+        assert_eq!(
+            cfg.lid_pn_cache.capacity,
+            u64::MAX,
+            "lid_pn_cache must be effectively unbounded; capacity-LRU re-introduces the eviction bug at higher thresholds"
+        );
     }
 }

@@ -5,6 +5,7 @@ mod community;
 mod contacts;
 mod groups;
 mod media_reupload;
+pub mod message_edit;
 mod mex;
 pub(crate) mod newsletter;
 mod polls;
@@ -28,12 +29,16 @@ pub use chatstate::{ChatStateType, Chatstate};
 pub use contacts::{Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo};
 
 pub use groups::{
-    CreateGroupResult, GroupCreateOptions, GroupDescription, GroupMetadata, GroupParticipant,
-    GroupParticipantOptions, GroupSubject, Groups, JoinGroupResult, MemberAddMode, MemberLinkMode,
-    MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
+    BatchGroupResult, CreateGroupResult, GroupCreateOptions, GroupDescription, GroupJoinError,
+    GroupMetadata, GroupParticipant, GroupParticipantOptions, GroupProfilePicture, GroupSubject,
+    Groups, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
+    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
+    ParticipantType, PictureType,
 };
 
 pub use media_reupload::{MediaRetryResult, MediaReupload, MediaReuploadRequest};
+
+pub use message_edit::{EncryptedEdit, SecretEncKind, SecretEncrypted};
 
 pub use mex::{Mex, MexError, MexErrorExtensions, MexGraphQLError, MexRequest, MexResponse};
 

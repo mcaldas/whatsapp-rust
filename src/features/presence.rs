@@ -1,7 +1,7 @@
 use crate::client::Client;
 use log::{debug, warn};
 use thiserror::Error;
-use wacore::StringEnum;
+use wacore::WireEnum;
 use wacore::iq::tctoken::build_tc_token_node;
 use wacore_binary::Jid;
 use wacore_binary::Node;
@@ -16,12 +16,12 @@ pub enum PresenceError {
 }
 
 /// Presence status for online/offline state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StringEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
 #[non_exhaustive]
 pub enum PresenceStatus {
-    #[str = "available"]
+    #[wire = "available"]
     Available,
-    #[str = "unavailable"]
+    #[wire = "unavailable"]
     Unavailable,
 }
 
@@ -82,8 +82,14 @@ impl<'a> Presence<'a> {
             return Err(PresenceError::PushNameEmpty);
         }
 
-        if status == PresenceStatus::Available {
-            self.client.send_unified_session().await;
+        // Track receipt activity like whatsmeow: available -> active receipts,
+        // unavailable -> back to inactive (a forced value is preserved).
+        match status {
+            PresenceStatus::Available => {
+                self.client.send_unified_session().await;
+                self.client.mark_receipts_active_on_presence();
+            }
+            PresenceStatus::Unavailable => self.client.mark_receipts_inactive_on_presence(),
         }
 
         let presence_type = status.as_str();

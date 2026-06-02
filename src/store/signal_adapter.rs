@@ -15,10 +15,11 @@ use wacore::libsignal::store::{
     PreKeyStore as WacorePreKeyStore, SignedPreKeyStore as WacoreSignedPreKeyStore,
 };
 
-fn signal_err<E: std::fmt::Display>(
-    context: &'static str,
-) -> impl FnOnce(E) -> SignalProtocolError {
-    move |e| SignalProtocolError::InvalidState(context, e.to_string())
+fn signal_err<E>(context: &'static str) -> impl FnOnce(E) -> SignalProtocolError
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+{
+    move |e| SignalProtocolError::BackendError(context, e.into())
 }
 
 #[derive(Clone)]
@@ -137,17 +138,10 @@ impl IdentityKeyStore for IdentityAdapter {
     ) -> Result<IdentityChange, SignalProtocolError> {
         let existing_identity = self.get_identity(address).await?;
 
-        // Update the Device's in-memory identity store first (for is_trusted_identity checks).
-        // Cache is only marked dirty after Device accepts the identity.
-        let mut device = self.0.device.write().await;
-        IdentityKeyStore::save_identity(&mut *device, address, identity)
-            .await
-            .map_err(signal_err("save_identity"))?;
-        drop(device);
-
-        // Device accepted — now write to cache (deferred flush to DB)
-        // Store raw 32-byte public key (not 33-byte serialized form with 0x05 prefix),
-        // matching what SignalStore::put_identity expects.
+        // Cache-first: write to cache only. The cache flushes to the backend
+        // during flush_signal_cache(). This avoids a synchronous backend write
+        // on every encrypt/decrypt. is_trusted_identity always returns true
+        // (matching WA Web), so the Device-level save is redundant.
         self.0
             .cache
             .put_identity(address, identity.public_key().public_key_bytes())
@@ -162,14 +156,16 @@ impl IdentityKeyStore for IdentityAdapter {
 
     async fn is_trusted_identity(
         &self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
-        direction: Direction,
+        _address: &ProtocolAddress,
+        _identity: &IdentityKey,
+        _direction: Direction,
     ) -> Result<bool, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        IdentityKeyStore::is_trusted_identity(&*device, address, identity, direction)
-            .await
-            .map_err(signal_err("is_trusted_identity"))
+        // WAWebProtocolStoreUnifiedApi.isTrustedIdentity always returns true;
+        // identity changes surface via save_identity. Avoid acquiring the
+        // device RwLock just to delegate to a stub — the read is acquired N
+        // times per group send (once per recipient device) and adds
+        // contention pressure under any future parallel encrypt path.
+        Ok(true)
     }
 
     async fn get_identity(
@@ -272,5 +268,12 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
             .get_sender_key(sender_key_name, &*device.backend)
             .await
             .map_err(signal_err("backend"))
+    }
+
+    async fn sender_key_lock(
+        &self,
+        sender_key_name: &SenderKeyName,
+    ) -> std::sync::Arc<async_lock::Mutex<()>> {
+        self.0.cache.sender_key_lock(sender_key_name).await
     }
 }

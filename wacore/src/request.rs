@@ -1,4 +1,4 @@
-use crate::StringEnum;
+use crate::WireEnum;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -8,11 +8,11 @@ use wacore_binary::{Jid, JidExt, LEGACY_USER_SERVER};
 use wacore_binary::{Node, NodeContent, NodeRef};
 
 /// IQ request type for WhatsApp protocol queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StringEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
 pub enum InfoQueryType {
-    #[str = "set"]
+    #[wire = "set"]
     Set,
-    #[str = "get"]
+    #[wire = "get"]
     Get,
 }
 
@@ -82,16 +82,14 @@ impl<'a> InfoQuery<'a> {
 pub enum IqError {
     #[error("IQ request timed out")]
     Timeout,
-    #[error("Client is not connected")]
+    #[error("client is not connected")]
     NotConnected,
-    #[error("Received disconnect node during IQ wait: {0:?}")]
+    #[error("received disconnect node during IQ wait: {0:?}")]
     Disconnected(Node),
-    #[error("Received a server error response: code={code}, text='{text}'")]
+    #[error("received a server error response: code={code}, text='{text}'")]
     ServerError { code: u16, text: String },
-    #[error("Internal channel closed unexpectedly")]
+    #[error("internal channel closed unexpectedly")]
     InternalChannelClosed,
-    #[error("Network error: {0}")]
-    Network(String),
 }
 
 /// Lightweight server error that can be embedded in `anyhow::Error` and
@@ -150,7 +148,7 @@ impl RequestUtils {
     pub fn generate_message_id(&self, user_jid: Option<&Jid>) -> String {
         let mut data = Vec::with_capacity(8 + 20 + 16);
 
-        let timestamp = crate::time::now_secs() as u64;
+        let timestamp = crate::time::now_secs_u64();
         data.extend_from_slice(&timestamp.to_be_bytes());
 
         if let Some(jid) = user_jid {
@@ -178,30 +176,22 @@ impl RequestUtils {
         id
     }
 
-    pub fn build_iq_node(&self, query: &InfoQuery<'_>, req_id: Option<String>) -> Node {
+    pub fn build_iq_node(&self, query: InfoQuery<'_>, req_id: Option<String>) -> Node {
         let id = req_id.unwrap_or_else(|| self.generate_request_id());
 
         let mut builder = NodeBuilder::new("iq")
             .attr("id", id)
             .attr("xmlns", query.namespace)
             .attr("type", query.query_type.as_str())
-            .attr("to", &query.to);
+            .attr("to", query.to);
 
-        if let Some(target) = &query.target
+        if let Some(target) = query.target
             && !target.is_empty()
         {
             builder = builder.attr("target", target);
         }
 
-        if let Some(content) = &query.content {
-            match content {
-                NodeContent::Bytes(b) => builder = builder.bytes(b.clone()),
-                NodeContent::String(s) => builder = builder.string_content(s.clone()),
-                NodeContent::Nodes(n) => builder = builder.children(n.clone()),
-            }
-        }
-
-        builder.build()
+        builder.apply_content(query.content).build()
     }
 
     pub fn parse_iq_response(&self, response_node: &NodeRef<'_>) -> Result<(), IqError> {

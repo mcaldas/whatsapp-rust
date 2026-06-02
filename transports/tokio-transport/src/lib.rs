@@ -6,18 +6,29 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, error, trace, warn};
+use log::{debug, warn};
 use std::sync::{Arc, Once};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
-use tokio_websockets::{ClientBuilder, Connector, Message, WebSocketStream};
-use wacore::net::{Transport, TransportEvent, TransportFactory, WHATSAPP_WEB_WS_URL};
+use tokio_websockets::{ClientBuilder, Message, WebSocketStream};
+use wacore::net::{
+    DisconnectReason, Transport, TransportEvent, TransportFactory, WHATSAPP_WEB_WS_URL,
+};
 
-const EVENT_CHANNEL_CAPACITY: usize = 10_000;
+pub use tokio_websockets::Connector;
+
+const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
-fn create_tls_connector() -> Connector {
+/// Returns the default TLS connector used by [`TokioWebSocketTransportFactory`].
+///
+/// Useful as a starting point when users need to inspect or replicate the
+/// default TLS configuration before customizing it via [`TokioWebSocketTransportFactory::with_connector`].
+///
+/// On first call, installs `ring` as the global rustls crypto provider
+/// (no-op if one is already installed).
+pub fn default_tls_connector() -> Connector {
     CRYPTO_PROVIDER_INIT.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
@@ -122,7 +133,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> WsTransport<S> {
 
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for WsTransport<S> {
-    async fn send(&self, data: Vec<u8>) -> Result<(), anyhow::Error> {
+    async fn send(&self, data: bytes::Bytes) -> Result<(), anyhow::Error> {
         let mut guard = self.sink.lock().await;
         let sink = guard
             .as_mut()
@@ -152,6 +163,11 @@ async fn read_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     tx: async_channel::Sender<TransportEvent>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Default covers the shutdown-initiated breaks (our own disconnect, where
+    // the client already knows the cause); the receive arms overwrite it with
+    // the real reason so a clean server recycle is distinguishable from an
+    // abrupt EOF or a read error in the logs.
+    let mut reason = DisconnectReason::Unknown;
     loop {
         tokio::select! {
             biased;
@@ -172,23 +188,35 @@ async fn read_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     }
                 }
                 Some(Ok(msg)) if msg.is_close() => {
-                    trace!("Received close frame");
+                    reason = match msg.as_close() {
+                        Some((code, text)) => DisconnectReason::ServerClose {
+                            code: Some(u16::from(code)),
+                            reason: text.to_owned(),
+                        },
+                        None => DisconnectReason::ServerClose {
+                            code: None,
+                            reason: String::new(),
+                        },
+                    };
+                    debug!("Received close frame: {reason}");
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong/text handled by tokio-websockets
                 Some(Err(e)) => {
-                    error!("WebSocket read error: {e}");
+                    reason = DisconnectReason::ReadError(e.to_string());
+                    warn!("WebSocket read error: {e}");
                     break;
                 }
                 None => {
-                    trace!("WebSocket stream ended");
+                    reason = DisconnectReason::StreamEnded;
+                    debug!("WebSocket stream ended");
                     break;
                 }
             },
         }
     }
 
-    let _ = tx.send(TransportEvent::Disconnected).await;
+    let _ = tx.send(TransportEvent::Disconnected(reason)).await;
 }
 
 /// Wraps an already-upgraded [`WebSocketStream`] into a [`Transport`] + event channel.
@@ -219,17 +247,29 @@ where
 /// For custom connection logic, use [`from_websocket`] directly.
 pub struct TokioWebSocketTransportFactory {
     url: String,
+    connector: Option<Connector>,
 }
 
 impl TokioWebSocketTransportFactory {
     pub fn new() -> Self {
         Self {
             url: WHATSAPP_WEB_WS_URL.to_string(),
+            connector: None,
         }
     }
 
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         self.url = url.into();
+        self
+    }
+
+    /// Use a custom TLS [`Connector`] instead of the built-in default.
+    ///
+    /// This is the primary extension point for custom TLS configuration
+    /// (e.g. custom CA certificates, client certs). For full proxy support,
+    /// implement [`TransportFactory`] directly and use [`from_websocket`].
+    pub fn with_connector(mut self, connector: Connector) -> Self {
+        self.connector = Some(connector);
         self
     }
 }
@@ -245,15 +285,23 @@ impl TransportFactory for TokioWebSocketTransportFactory {
     async fn create_transport(
         &self,
     ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error> {
-        let connector = create_tls_connector();
         let uri: http::Uri = self
             .url
             .parse()
             .map_err(|e| anyhow::anyhow!("Failed to parse URL: {e}"))?;
 
+        let default_connector;
+        let connector = match &self.connector {
+            Some(c) => c,
+            None => {
+                default_connector = default_tls_connector();
+                &default_connector
+            }
+        };
+
         debug!("Dialing {}", self.url);
         let (ws, _) = ClientBuilder::from_uri(uri)
-            .connector(&connector)
+            .connector(connector)
             .connect()
             .await
             .map_err(|e| anyhow::anyhow!("WebSocket connect failed: {e}"))?;

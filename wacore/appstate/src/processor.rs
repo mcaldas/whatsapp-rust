@@ -119,7 +119,7 @@ where
             .ok_or(AppStateError::MissingKeyId)?;
         let keys = get_keys(key_id)?;
 
-        let mutation = decode_record(
+        let (mutation, macs) = decode_record(
             wa::syncd_mutation::SyncdOperation::Set,
             rec,
             &keys,
@@ -128,8 +128,8 @@ where
         )?;
 
         mutation_macs.push(AppStateMutationMAC {
-            index_mac: mutation.index_mac.clone(),
-            value_mac: mutation.value_mac.clone(),
+            index_mac: macs.index_mac,
+            value_mac: macs.value_mac,
         });
 
         mutations.push(mutation);
@@ -254,17 +254,17 @@ where
                 .ok_or(AppStateError::MissingKeyId)?;
             let keys = get_keys(key_id)?;
 
-            let mutation = decode_record(op, rec, &keys, key_id, validate_macs)?;
+            let (mutation, macs) = decode_record(op, rec, &keys, key_id, validate_macs)?;
 
             match op {
                 wa::syncd_mutation::SyncdOperation::Set => {
                     added_macs.push(AppStateMutationMAC {
-                        index_mac: mutation.index_mac.clone(),
-                        value_mac: mutation.value_mac.clone(),
+                        index_mac: macs.index_mac,
+                        value_mac: macs.value_mac,
                     });
                 }
                 wa::syncd_mutation::SyncdOperation::Remove => {
-                    removed_index_macs.push(mutation.index_mac.clone());
+                    removed_index_macs.push(macs.index_mac);
                 }
             }
 
@@ -470,6 +470,13 @@ mod tests {
         assert_eq!(result.state.version, 1);
         assert_eq!(result.mutations.len(), 1);
         assert_eq!(result.mutation_macs.len(), 1);
+        // Exact MAC bytes (not just counts): catches empty/swapped MACs.
+        assert_eq!(result.mutation_macs[0].index_mac, index_mac);
+        assert!(!result.mutation_macs[0].value_mac.is_empty());
+        assert_ne!(
+            result.mutation_macs[0].index_mac,
+            result.mutation_macs[0].value_mac
+        );
         assert_eq!(
             result.mutations[0]
                 .action_value
@@ -516,6 +523,13 @@ mod tests {
         assert_eq!(result.state.version, 2);
         assert_eq!(result.mutations.len(), 1);
         assert_eq!(result.added_macs.len(), 1);
+        // Exact MAC bytes (not just counts): catches empty/swapped MACs.
+        assert_eq!(result.added_macs[0].index_mac, index_mac);
+        assert!(!result.added_macs[0].value_mac.is_empty());
+        assert_ne!(
+            result.added_macs[0].index_mac,
+            result.added_macs[0].value_mac
+        );
         assert!(result.removed_index_macs.is_empty());
     }
 

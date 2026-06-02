@@ -11,8 +11,8 @@ use wacore::stanza::groups::{GroupNotification, GroupNotificationAction};
 use wacore::store::traits::{DeviceInfo, DeviceListRecord};
 use wacore::types::events::{
     BusinessStatusUpdate, BusinessUpdateType, ContactNumberChanged, ContactSyncRequested,
-    ContactUpdated, DeviceListUpdate, DeviceNotificationInfo, GroupUpdate, PictureUpdate,
-    UserAboutUpdate,
+    ContactUpdated, DeviceListUpdate, DeviceNotificationInfo, GroupUpdate, MexNotification,
+    PictureUpdate, UserAboutUpdate,
 };
 use wacore_binary::NodeContentRef;
 use wacore_binary::{Jid, JidExt};
@@ -46,214 +46,167 @@ impl StanzaHandler for NotificationHandler {
     }
 }
 
+/// Dispatch notification by type. Each arm calls a separate async fn so the
+/// compiler doesn't size this future for all arms simultaneously.
 async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
-    let notification_type = notification_type.as_deref().unwrap_or_default();
 
-    match notification_type {
-        "encrypt" => {
-            // Identity change: <notification type="encrypt" from="user@s.whatsapp.net">
-            //   <identity/>
-            // </notification>
-            // WA Web: WAWebHandleIdentityChange — clears device record, deletes sessions,
-            // marks sender keys for rotation, re-establishes session.
-            if nr.get_optional_child("identity").is_some() {
-                handle_identity_change(client, nr).await;
-            } else if nr
-                .get_attr("from")
-                .is_some_and(|v| v.as_str() == wacore_binary::SERVER_JID)
-            {
-                // Server-originated encrypt notifications:
-                // "count" → handlePreKeyLow, "digest" → handleDigestKey
-                let first_child_tag = nr
-                    .children()
-                    .and_then(|c| c.first().map(|n| n.tag.as_ref()));
-
-                match first_child_tag {
-                    Some("count") => {
-                        handle_prekey_low(client).await;
-                    }
-                    Some("digest") => {
-                        handle_digest_key(client);
-                    }
-                    other => {
-                        warn!("Unhandled encrypt notification child: {:?}", other);
-                    }
-                }
-            }
-        }
-        "server_sync" => {
-            // Server sync notifications inform us of app state changes from other devices.
-            // Matches WhatsApp Web's handleServerSyncNotification which calls
-            // markCollectionsForSync() with the parsed collection names.
-            use std::str::FromStr;
-            use wacore::appstate::patch_decode::WAPatchName;
-
-            let mut collections = Vec::new();
-            if let Some(children) = nr.children() {
-                for collection_node in children.iter().filter(|c| c.tag == "collection") {
-                    let name_cow = collection_node.attrs().optional_string("name");
-                    let name_str = name_cow.as_deref().unwrap_or("<unknown>");
-                    let server_version =
-                        collection_node.attrs().optional_u64("version").unwrap_or(0);
-                    debug!(
-                        target: "Client/AppState",
-                        "Received server_sync for collection '{}' version {}",
-                        name_str, server_version
-                    );
-                    if let Ok(patch_name) = WAPatchName::from_str(name_str)
-                        && !matches!(patch_name, WAPatchName::Unknown)
-                    {
-                        collections.push((patch_name, server_version));
-                    }
-                }
-            }
-
-            if !collections.is_empty() {
-                let client_clone = client.clone();
-                let generation = client
-                    .connection_generation
-                    .load(std::sync::atomic::Ordering::Acquire);
-                client.runtime.spawn(Box::pin(async move {
-                    // Check if connection was replaced before starting sync
-                    if client_clone
-                        .connection_generation
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        != generation
-                    {
-                        log::debug!(target: "Client/AppState", "server_sync task cancelled: connection generation changed");
-                        return;
-                    }
-
-                    // Filter by version comparison before syncing.
-                    // Matches WA Web's markCollectionsForSync version comparison filter.
-                    let backend = client_clone.persistence_manager.backend();
-                    let mut to_sync = Vec::new();
-                    for (name, server_version) in collections {
-                        if server_version > 0 {
-                            match backend.get_version(name.as_str()).await {
-                                Ok(state) if state.version >= server_version => {
-                                    debug!(
-                                        target: "Client/AppState",
-                                        "Skipping server_sync for {:?}: local version {} >= server version {}",
-                                        name, state.version, server_version
-                                    );
-                                    continue;
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    warn!(
-                                        target: "Client/AppState",
-                                        "Failed to get local version for {:?}: {e}, syncing anyway", name
-                                    );
-                                }
-                            }
-                        }
-                        to_sync.push(name);
-                    }
-
-                    if !to_sync.is_empty() {
-                        if client_clone.is_shutting_down() {
-                            log::debug!(target: "Client/AppState", "Skipping server_sync: client is shutting down");
-                            return;
-                        }
-                        // Re-check generation after version filtering to avoid syncing
-                        // against a stale connection after the awaited work above.
-                        if client_clone
-                            .connection_generation
-                            .load(std::sync::atomic::Ordering::Acquire)
-                            != generation
-                        {
-                            log::debug!(target: "Client/AppState", "server_sync task cancelled: connection generation changed during version check");
-                            return;
-                        }
-                        if let Err(e) = client_clone.sync_collections_batched(to_sync).await
-                            && !client_clone.is_shutting_down()
-                        {
-                            warn!(
-                                target: "Client/AppState",
-                                "Failed to batch sync app state from server_sync: {e}"
-                            );
-                        }
-                    }
-                })).detach();
-            }
-        }
-        "account_sync" => {
-            // Handle push name updates
-            if let Some(new_push_name) = nr.attrs().optional_string("pushname") {
-                client
-                    .clone()
-                    .update_push_name_and_notify(new_push_name.to_string())
-                    .await;
-            }
-
-            // Handle device list updates (when a new device is paired)
-            // Matches WhatsApp Web's handleAccountSyncNotification for DEVICES type
-            if let Some(devices_node) = nr.get_optional_child_by_tag(&["devices"]) {
-                handle_account_sync_devices(client, nr, devices_node).await;
-            }
-        }
-        "devices" => {
-            // Handle device list change notifications (WhatsApp Web: handleDevicesNotification)
-            // These are sent when a user adds, removes, or updates a device
-            handle_devices_notification(client, nr).await;
-        }
+    match notification_type.as_deref().unwrap_or_default() {
+        "encrypt" => handle_encrypt_notification(client, nr).await,
+        "server_sync" => handle_server_sync_notification(client, nr),
+        "account_sync" => handle_account_sync_notification(client, nr).await,
+        "devices" => handle_devices_notification(client, nr).await,
         "link_code_companion_reg" => {
-            // Handle pair code notification (stage 2 of pair code authentication)
-            // This is sent when the user enters the code on their phone
             crate::pair_code::handle_pair_code_notification(client, nr).await;
         }
-        "business" => {
-            // Handle business notification (WhatsApp Web: handleBusinessNotification)
-            // Notifies about business account status changes: verified name, profile, removal
-            handle_business_notification(client, nr).await;
-        }
-        "picture" => {
-            // Handle profile picture change notifications (WhatsApp Web: WAWebHandleProfilePicNotification)
-            handle_picture_notification(client, nr);
-        }
-        "privacy_token" => {
-            // Handle incoming trusted contact privacy token notifications.
-            // Matches WhatsApp Web's WAWebHandlePrivacyTokenNotification.
-            handle_privacy_token_notification(client, nr).await;
-        }
-        "status" => {
-            // Handle status/about text change notifications (WhatsApp Web: WAWebHandleAboutNotification)
-            handle_status_notification(client, nr);
-        }
-        "contacts" => {
-            handle_contacts_notification(client, nr).await;
-        }
-        "w:gp2" => {
-            handle_group_notification(client, Arc::clone(&node)).await;
-        }
-        "disappearing_mode" => {
-            // WA Web: WAWebHandleDisappearingModeNotification →
-            // WAWebUpdateDisappearingModeForContact.
-            // Parses <disappearing_mode duration="..." t="..."/> child,
-            // updates the contact's default ephemeral setting.
-            handle_disappearing_mode_notification(client, nr);
-        }
-        "newsletter" => {
-            handle_newsletter_notification(client, Arc::clone(&node));
-        }
+        "business" => handle_business_notification(client, nr).await,
+        "picture" => handle_picture_notification(client, nr),
+        "privacy_token" => handle_privacy_token_notification(client, nr).await,
+        "status" => handle_status_notification(client, nr),
+        "contacts" => handle_contacts_notification(client, nr).await,
+        "w:gp2" => handle_group_notification(client, Arc::clone(&node)).await,
+        "disappearing_mode" => handle_disappearing_mode_notification(client, nr),
+        "newsletter" => handle_newsletter_notification(client, Arc::clone(&node)),
+        "mex" => handle_mex_notification(client, nr),
         "mediaretry" => {
-            // Handled by wait_for_node waiter in MediaReupload::request().
-            // Ack is sent automatically by the stanza dispatch loop.
             debug!(
                 "Received mediaretry notification for msg {}",
                 nr.attrs().optional_string("id").unwrap_or_default()
             );
         }
-        _ => {
-            debug!("Unhandled notification type '{notification_type}', dispatching raw event");
+        other => {
+            debug!("Unhandled notification type '{other}', dispatching raw event");
             client
                 .core
                 .event_bus
                 .dispatch(Event::Notification(Arc::clone(&node)));
         }
+    }
+}
+
+async fn handle_encrypt_notification(client: &Arc<Client>, nr: &wacore_binary::NodeRef<'_>) {
+    if nr.get_optional_child("identity").is_some() {
+        handle_identity_change(client, nr).await;
+    } else if nr
+        .get_attr("from")
+        .is_some_and(|v| v.as_str() == wacore_binary::SERVER_JID)
+    {
+        let first_child_tag = nr
+            .children()
+            .and_then(|c| c.first().map(|n| n.tag.as_ref()));
+        match first_child_tag {
+            Some("count") => handle_prekey_low(client).await,
+            Some("digest") => handle_digest_key(client),
+            other => warn!("Unhandled encrypt notification child: {:?}", other),
+        }
+    }
+}
+
+/// Sync is fire-and-forget (spawned), so this is not async -- it parses
+/// collection nodes synchronously and spawns the async sync task.
+fn handle_server_sync_notification(client: &Arc<Client>, nr: &wacore_binary::NodeRef<'_>) {
+    use std::str::FromStr;
+    use wacore::appstate::patch_decode::WAPatchName;
+
+    let mut collections = Vec::new();
+    if let Some(children) = nr.children() {
+        for collection_node in children.iter().filter(|c| c.tag == "collection") {
+            let name_cow = collection_node.attrs().optional_string("name");
+            let name_str = name_cow.as_deref().unwrap_or("<unknown>");
+            let server_version = collection_node.attrs().optional_u64("version").unwrap_or(0);
+            debug!(
+                target: "Client/AppState",
+                "Received server_sync for collection '{}' version {}",
+                name_str, server_version
+            );
+            if let Ok(patch_name) = WAPatchName::from_str(name_str)
+                && !matches!(patch_name, WAPatchName::Unknown)
+            {
+                collections.push((patch_name, server_version));
+            }
+        }
+    }
+
+    if !collections.is_empty() {
+        let client_clone = client.clone();
+        let generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        client
+            .runtime
+            .spawn(Box::pin(async move {
+                if client_clone
+                    .connection_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != generation
+                {
+                    log::debug!(target: "Client/AppState", "server_sync task cancelled: connection generation changed");
+                    return;
+                }
+
+                let backend = client_clone.persistence_manager.backend();
+                let mut to_sync = Vec::new();
+                for (name, server_version) in collections {
+                    if server_version > 0 {
+                        match backend.get_version(name.as_str()).await {
+                            Ok(state) if state.version >= server_version => {
+                                debug!(
+                                    target: "Client/AppState",
+                                    "Skipping server_sync for {:?}: local version {} >= server version {}",
+                                    name, state.version, server_version
+                                );
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(
+                                    target: "Client/AppState",
+                                    "Failed to get local version for {:?}: {e}, syncing anyway",
+                                    name
+                                );
+                            }
+                        }
+                    }
+                    to_sync.push(name);
+                }
+
+                if !to_sync.is_empty() {
+                    if client_clone.is_shutting_down() {
+                        log::debug!(target: "Client/AppState", "Skipping server_sync: client is shutting down");
+                        return;
+                    }
+                    if client_clone
+                        .connection_generation
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != generation
+                    {
+                        log::debug!(target: "Client/AppState", "server_sync task cancelled: connection generation changed during version check");
+                        return;
+                    }
+                    if let Err(e) = client_clone.sync_collections_batched(to_sync).await
+                        && !client_clone.is_shutting_down()
+                    {
+                        warn!(
+                            target: "Client/AppState",
+                            "Failed to batch sync app state from server_sync: {e}"
+                        );
+                    }
+                }
+            }))
+            .detach();
+    }
+}
+
+async fn handle_account_sync_notification(client: &Arc<Client>, nr: &wacore_binary::NodeRef<'_>) {
+    if let Some(new_push_name) = nr.attrs().optional_string("pushname") {
+        client
+            .clone()
+            .update_push_name_and_notify(new_push_name.to_string())
+            .await;
+    }
+    if let Some(devices_node) = nr.get_optional_child_by_tag(&["devices"]) {
+        handle_account_sync_devices(client, nr, devices_node).await;
     }
 }
 
@@ -313,16 +266,18 @@ async fn handle_prekey_low(client: &Arc<Client>) {
 ///
 /// Matches WA Web's `WAWebHandleDigestKey`:
 /// Queries server for key bundle digest, validates SHA-1 hash locally,
-/// re-uploads if mismatch or missing.
+/// re-uploads only when the server has no record (404).
 ///
-/// Acquires `prekey_upload_lock` to serialize with the count-based upload path,
-/// preventing concurrent uploads that could race on prekey ID allocation.
+/// `validate_digest_key` owns `prekey_upload_lock` acquisition internally, so
+/// any upload it triggers stays serialized with `upload_pre_keys_at_login`,
+/// `handle_prekey_low`, and `refresh_pre_keys` without this caller needing to
+/// (and indeed, holding it here would deadlock — `async_lock::Mutex` is not
+/// reentrant).
 fn handle_digest_key(client: &Arc<Client>) {
     let client_clone = client.clone();
     client
         .runtime
         .spawn(Box::pin(async move {
-            let _guard = client_clone.prekey_upload_lock.lock().await;
             if let Err(e) = client_clone.validate_digest_key().await {
                 warn!("Digest key validation failed: {:?}", e);
             }
@@ -342,10 +297,7 @@ fn handle_digest_key(client: &Arc<Client>) {
 /// WA Web defers this when offline. We process immediately because all cleanup
 /// is local-only, and `ensure_e2e_sessions` self-defers via `wait_for_offline_delivery_end`.
 async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
-    let Some(from_jid) = node.attrs().optional_jid("from") else {
-        warn!("Identity change notification missing 'from' attribute");
-        return;
-    };
+    let from_jid = crate::require_from_jid!(node, "Identity change notification");
 
     // Only primary device identity changes matter
     if from_jid.device != 0 {
@@ -403,7 +355,8 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
 
         let status_group = "status@broadcast";
         for own_jid in device_snapshot.pn.iter().chain(device_snapshot.lid.iter()) {
-            let sk_name = SenderKeyName::from_jid(&status_group, &own_jid.to_protocol_address());
+            let sk_name =
+                SenderKeyName::from_parts(status_group, own_jid.to_protocol_address().as_str());
             client
                 .signal_cache
                 .delete_sender_key(sk_name.cache_key())
@@ -576,13 +529,11 @@ async fn handle_account_sync_devices(
     devices_node: &NodeRef<'_>,
 ) {
     // Extract the "from" JID - this is the account the notification is about
-    let from_jid = match node.attrs().optional_jid("from") {
-        Some(jid) => jid,
-        None => {
-            warn!(target: "Client/AccountSync", "account_sync devices missing 'from' attribute");
-            return;
-        }
-    };
+    let from_jid = crate::require_from_jid!(
+        node,
+        target: "Client/AccountSync",
+        "account_sync devices"
+    );
 
     // Get our own JIDs (PN and LID) to verify this is about our account
     let device_snapshot = client.persistence_manager.get_device_snapshot().await;
@@ -702,8 +653,8 @@ async fn handle_privacy_token_notification(client: &Arc<Client>, node: &NodeRef<
         .filter(|j| !j.user.is_empty());
 
     // Resolve to a LID key. We borrow from Jid.user (CompactString) or from
-    // get_current_lid (String), then pass as &str to the storage layer.
-    let resolved_lid: Option<String>;
+    // get_current_lid (CompactString), then pass as &str to the storage layer.
+    let resolved_lid: Option<wacore_binary::CompactString>;
     let sender_lid: &str = if let Some(ref lid_jid) = sender_lid_jid {
         &lid_jid.user
     } else {
@@ -849,7 +800,7 @@ async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
     let event = Event::BusinessStatusUpdate(BusinessStatusUpdate {
         jid: notification.from.clone(),
         update_type,
-        timestamp: notification.timestamp,
+        timestamp: wacore::time::from_secs_or_now(notification.timestamp),
         target_jid: notification.jid.clone(),
         hash: notification.hash.clone(),
         verified_name,
@@ -915,13 +866,11 @@ async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
 /// </notification>
 /// ```
 fn handle_picture_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
-    let from = match node.attrs().optional_jid("from") {
-        Some(jid) => jid,
-        None => {
-            warn!(target: "Client/Picture", "picture notification missing 'from' attribute");
-            return;
-        }
-    };
+    let from = crate::require_from_jid!(
+        node,
+        target: "Client/Picture",
+        "picture notification"
+    );
 
     let timestamp = notification_timestamp(node);
 
@@ -1005,13 +954,11 @@ fn handle_picture_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
 /// </notification>
 /// ```
 fn handle_status_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
-    let from = match node.attrs().optional_jid("from") {
-        Some(jid) => jid,
-        None => {
-            warn!(target: "Client/Status", "status notification missing 'from' attribute");
-            return;
-        }
-    };
+    let from = crate::require_from_jid!(
+        node,
+        target: "Client/Status",
+        "status notification"
+    );
 
     let timestamp = notification_timestamp(node);
 
@@ -1045,8 +992,8 @@ fn notification_timestamp(node: &NodeRef<'_>) -> chrono::DateTime<chrono::Utc> {
     node.attrs()
         .optional_u64("t")
         .and_then(|t| i64::try_from(t).ok())
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .unwrap_or_else(chrono::Utc::now)
+        .and_then(wacore::time::from_secs)
+        .unwrap_or_else(wacore::time::now_utc)
 }
 
 /// Learn LID-PN mappings from a contacts modify notification.
@@ -1171,7 +1118,7 @@ async fn handle_contacts_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
             let after = child
                 .attrs()
                 .optional_u64("after")
-                .and_then(|after| chrono::DateTime::from_timestamp(after as i64, 0));
+                .and_then(|after| wacore::time::from_secs(after as i64));
 
             debug!(
                 target: "Client/Contacts",
@@ -1220,8 +1167,8 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
 
     let timestamp = i64::try_from(notification.timestamp)
         .ok()
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .unwrap_or_else(chrono::Utc::now);
+        .and_then(wacore::time::from_secs)
+        .unwrap_or_else(wacore::time::now_utc);
 
     for action in notification.actions {
         // Granularly patch group cache instead of invalidating — matches WA Web's
@@ -1231,11 +1178,11 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
             GroupNotificationAction::Add { participants, .. } => {
                 let group_cache = client.get_group_cache().await;
                 if let Some(mut info) = group_cache.get(&notification.group_jid).await {
-                    let new: Vec<_> = participants
-                        .iter()
-                        .map(|p| (p.jid.clone(), p.phone_number.clone()))
-                        .collect();
-                    info.add_participants(&new);
+                    info.add_participants(
+                        participants
+                            .iter()
+                            .map(|p| (&p.jid, p.phone_number.as_ref())),
+                    );
                     group_cache
                         .insert(notification.group_jid.clone(), info)
                         .await;
@@ -1247,10 +1194,9 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                 }
             }
             GroupNotificationAction::Remove { participants, .. } => {
+                let users: Vec<&str> = participants.iter().map(|p| p.jid.user.as_str()).collect();
                 let group_cache = client.get_group_cache().await;
                 if let Some(mut info) = group_cache.get(&notification.group_jid).await {
-                    let users: Vec<&str> =
-                        participants.iter().map(|p| p.jid.user.as_str()).collect();
                     info.remove_participants(&users);
                     group_cache
                         .insert(notification.group_jid.clone(), info)
@@ -1261,6 +1207,12 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                         notification.group_jid, participants.len()
                     );
                 }
+                client
+                    .rotate_sender_key_on_participant_remove(
+                        &notification.group_jid.to_string(),
+                        &users,
+                    )
+                    .await;
             }
             _ => {}
         }
@@ -1363,6 +1315,68 @@ fn handle_newsletter_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
         .dispatch(Event::Notification(Arc::clone(&node)));
 }
 
+/// `<notification type="mex"><update op_name="…">{json}</update></notification>`
+/// Routed by `op_name` so the dispatcher survives bundle rebuilds.
+fn handle_mex_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
+    let Some(update_node) = node.get_optional_child("update") else {
+        warn!(
+            target: "Client/Mex",
+            "mex notification missing <update> child: {}",
+            wacore::xml::DisplayableNodeRef(node)
+        );
+        return;
+    };
+
+    let Some(op_name) = update_node.attrs().optional_string("op_name") else {
+        warn!(
+            target: "Client/Mex",
+            "mex notification <update> missing op_name attribute: {}",
+            wacore::xml::DisplayableNodeRef(node)
+        );
+        return;
+    };
+
+    // `from_str` skips the redundant UTF-8 validation `from_slice` would
+    // do on a `&str`.
+    let parsed = match update_node.content.as_deref() {
+        Some(NodeContentRef::String(s)) => serde_json::from_str(s),
+        Some(NodeContentRef::Bytes(b)) => serde_json::from_slice(b.as_ref()),
+        _ => {
+            warn!(target: "Client/Mex", "mex notification op={op_name} has no JSON body");
+            return;
+        }
+    };
+    let payload: serde_json::Value = match parsed {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(target: "Client/Mex", "mex notification op={op_name} JSON parse failed: {e}");
+            return;
+        }
+    };
+
+    let mut attrs = node.attrs();
+    let from = attrs.optional_jid("from");
+    let stanza_id = attrs.optional_string("id").map(|s| s.into_owned());
+    let offline = attrs.optional_string("offline").map(|s| s.into_owned());
+    let op_name = op_name.into_owned();
+
+    debug!(
+        target: "Client/Mex",
+        "mex notification received: op_name={op_name} offline={}",
+        offline.is_some()
+    );
+    client
+        .core
+        .event_bus
+        .dispatch(Event::MexNotification(MexNotification {
+            op_name,
+            from,
+            stanza_id,
+            offline,
+            payload,
+        }));
+}
+
 /// Handle `<notification type="disappearing_mode">` — a contact changed
 /// their default disappearing messages setting.
 ///
@@ -1396,7 +1410,8 @@ fn handle_disappearing_mode_notification(client: &Arc<Client>, node: &NodeRef<'_
     // WA Web: `t.attrTime("t")` — required, no default.
     let Some(setting_timestamp) = dm_attrs
         .optional_string("t")
-        .and_then(|s| s.parse::<u64>().ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(wacore::time::from_secs)
     else {
         warn!(
             "disappearing_mode notification missing or invalid 't' attribute: {}",
@@ -1698,7 +1713,7 @@ mod tests {
     /// Helper: parse a disappearing_mode notification node the same way
     /// the handler does, returning `(duration, setting_timestamp)` or `None`
     /// on validation failure.
-    fn parse_disappearing_mode(node: &Node) -> Option<(u32, u64)> {
+    fn parse_disappearing_mode(node: &Node) -> Option<(u32, i64)> {
         let dm_node = node.get_optional_child("disappearing_mode")?;
         let mut dm_attrs = dm_node.attrs();
         let duration = dm_attrs
@@ -1707,7 +1722,8 @@ mod tests {
             .unwrap_or(0);
         let setting_timestamp = dm_attrs
             .optional_string("t")
-            .and_then(|s| s.parse::<u64>().ok())?;
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&t| wacore::time::from_secs(t).is_some())?;
         Some((duration, setting_timestamp))
     }
 
@@ -1962,6 +1978,145 @@ mod tests {
         );
     }
 
+    /// Same PN on both sides is still dispatched as a ContactNumberChanged
+    /// event (with `old_jid == new_jid`). WA Web JS has no special guard for
+    /// this case either; the LID mapping update is a no-op when LIDs are
+    /// also equal. Consumers can filter if they care.
+    #[tokio::test]
+    async fn test_contacts_modify_same_jid_still_dispatches() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "contacts")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "contacts-modify-same")
+            .children([NodeBuilder::new("modify")
+                .attr("old", "5511999999999@s.whatsapp.net")
+                .attr("new", "5511999999999@s.whatsapp.net")
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        let events = collector.events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &*events[0],
+            Event::ContactNumberChanged(ContactNumberChanged { old_jid, new_jid, .. })
+                if old_jid == new_jid
+        ));
+    }
+
+    /// Partial LID (only `new_lid`, missing `old_lid`) must NOT create any
+    /// LID-PN mapping, since WA Web requires BOTH for createLidPnMappings.
+    #[tokio::test]
+    async fn test_contacts_modify_partial_lid_skips_mappings() {
+        let client = create_test_client().await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "contacts")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "contacts-modify-partial")
+            .children([NodeBuilder::new("modify")
+                .attr("old", "5511999999999@s.whatsapp.net")
+                .attr("new", "5511888888888@s.whatsapp.net")
+                .attr("new_lid", "100000022222222@lid")
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        assert!(
+            client
+                .lid_pn_cache
+                .get_phone_number("100000022222222")
+                .await
+                .is_none(),
+            "no mapping should be created when old_lid is missing"
+        );
+    }
+
+    /// Missing `new` attribute: the parser should warn and not dispatch
+    /// anything, mirroring WA Web's parser error path.
+    #[tokio::test]
+    async fn test_contacts_modify_missing_new_attr_drops_event() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "contacts")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "contacts-modify-bad")
+            .children([NodeBuilder::new("modify")
+                .attr("old", "5511999999999@s.whatsapp.net")
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        assert!(collector.events().is_empty());
+    }
+
+    /// Group `w:gp2` change_number: the parsed action must carry the new
+    /// owner from the child's `jid` attr and the sub_group_suggestions from
+    /// `<sub_group_suggestion jid=.../>` children. The old owner is the
+    /// notification's top-level `participant` attribute, surfaced on
+    /// `GroupUpdate.participant`.
+    #[tokio::test]
+    async fn test_group_change_number_dispatches_with_new_owner_and_suggestions() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "w:gp2")
+            .attr("from", "120363000000000000@g.us")
+            .attr("participant", "5511999999999@s.whatsapp.net")
+            .attr("id", "gp2-change-1")
+            .attr("t", "1773519041")
+            .children([NodeBuilder::new("change_number")
+                .attr("jid", "5511888888888@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("sub_group_suggestion")
+                        .attr("jid", "120363111111111111@g.us")
+                        .build(),
+                    NodeBuilder::new("sub_group_suggestion")
+                        .attr("jid", "120363222222222222@g.us")
+                        .build(),
+                ])
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        let events = collector.events();
+        let group_update = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::GroupUpdate(u) => Some(u),
+                _ => None,
+            })
+            .expect("expected GroupUpdate");
+
+        assert_eq!(
+            group_update.participant.as_ref().map(|j| j.user.as_str()),
+            Some("5511999999999"),
+            "old owner comes from notification.participant"
+        );
+        match &group_update.action {
+            GroupNotificationAction::ChangeNumber {
+                new_owner,
+                sub_group_suggestions,
+            } => {
+                assert_eq!(
+                    new_owner.as_ref().map(|j| j.user.as_str()),
+                    Some("5511888888888")
+                );
+                assert_eq!(sub_group_suggestions.len(), 2);
+            }
+            other => panic!("expected ChangeNumber, got {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn test_contacts_update_hash_only_ignored() {
         // WA Web sends <update hash="Quvc"/> without jid when using hash-based lookup.
@@ -2144,7 +2299,8 @@ mod tests {
             .await;
 
         // Pre-populate a sender key for status@broadcast
-        let sk_name = SenderKeyName::from_jid(&"status@broadcast", &own_jid.to_protocol_address());
+        let sk_name =
+            SenderKeyName::from_parts("status@broadcast", own_jid.to_protocol_address().as_str());
         let sk_record = wacore::libsignal::protocol::SenderKeyRecord::new_empty();
         client
             .signal_cache

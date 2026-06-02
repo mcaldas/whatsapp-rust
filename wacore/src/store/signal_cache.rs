@@ -43,7 +43,7 @@ fn evict_clean_entries<V>(
 }
 
 /// Default max entries per store before clean entry eviction triggers.
-const DEFAULT_MAX_CACHE_ENTRIES: usize = 10_000;
+const DEFAULT_MAX_CACHE_ENTRIES: usize = 2_000;
 
 /// In-memory write-back cache for Signal protocol state.
 /// Keys use `Arc<str>` for O(1) clone. Sessions cached as objects (serialized on flush).
@@ -52,6 +52,11 @@ pub struct SignalStoreCache {
     sessions: Mutex<SessionStoreState>,
     identities: Mutex<ByteStoreState>,
     sender_keys: Mutex<SenderKeyStoreState>,
+    /// Avoids per-flush Vec allocation on the hot path (called after every message).
+    flush_encode_buf: Mutex<Vec<u8>>,
+    /// Per-(group, sender) locks serializing each sender-key chain advance.
+    /// Coordination only (like the client session locks): never time-evicted.
+    sender_key_locks: Mutex<HashMap<Arc<str>, Arc<Mutex<()>>>>,
     max_entries: usize,
 }
 
@@ -264,8 +269,36 @@ impl SignalStoreCache {
             sessions: Mutex::new(SessionStoreState::new()),
             identities: Mutex::new(ByteStoreState::new()),
             sender_keys: Mutex::new(SenderKeyStoreState::new()),
+            flush_encode_buf: Mutex::new(Vec::with_capacity(4096)),
+            sender_key_locks: Mutex::new(HashMap::new()),
             max_entries,
         }
+    }
+
+    /// Whether any session or identity is known for `user` (across device ids),
+    /// checking the in-memory cache first, then the durable backend. Lets a
+    /// caller skip a per-device migration scan for a user we've never had Signal
+    /// state with. Conservative on the cache side: any matching key counts
+    /// (even a stale/checked-out marker), so it never reports "none" when state
+    /// might exist.
+    pub async fn has_state_for_user(&self, user: &str, backend: &dyn SignalStore) -> Result<bool> {
+        fn matches(addr: &str, user: &str) -> bool {
+            addr.strip_prefix(user)
+                .is_some_and(|rest| rest.starts_with('@') || rest.starts_with(':'))
+        }
+        {
+            let state = self.sessions.lock().await;
+            if state.cache.keys().any(|k| matches(k, user)) {
+                return Ok(true);
+            }
+        }
+        {
+            let state = self.identities.lock().await;
+            if state.cache.keys().any(|k| matches(k, user)) {
+                return Ok(true);
+            }
+        }
+        Ok(backend.has_signal_state_for_user(user).await?)
     }
 
     // === Sessions (object cache — serialize only during flush) ===
@@ -408,12 +441,22 @@ impl SignalStoreCache {
         backend: &dyn SignalStore,
     ) -> Result<Option<Arc<[u8]>>> {
         let key = address.as_str();
+        // Cache check inside scoped lock so concurrent callers don't queue on
+        // the mutex during the backend roundtrip. Mirrors get_session/has_session.
+        {
+            let state = self.identities.lock().await;
+            if let Some(cached) = state.cache.get(key) {
+                return Ok(cached.clone());
+            }
+        }
+        // Backend I/O outside the lock.
+        let data = backend.load_identity(key).await?;
+        let arc_data = data.map(Arc::from);
         let mut state = self.identities.lock().await;
+        // Re-check: another task may have populated the cache while we awaited.
         if let Some(cached) = state.cache.get(key) {
             return Ok(cached.clone());
         }
-        let data = backend.load_identity(key).await?;
-        let arc_data = data.map(Arc::from);
         state.cache.insert(Arc::from(key), arc_data.clone());
         state.evict_if_needed(self.max_entries);
         Ok(arc_data)
@@ -458,6 +501,22 @@ impl SignalStoreCache {
         state.evict_if_needed(self.max_entries);
     }
 
+    /// Shared lock for the `name` chain. Same name returns the same lock so a
+    /// concurrent encrypt can't read a chain iteration another is advancing.
+    pub async fn sender_key_lock(&self, name: &SenderKeyName) -> Arc<Mutex<()>> {
+        let mut map = self.sender_key_locks.lock().await;
+        if let Some(lock) = map.get(name.cache_key()) {
+            return lock.clone();
+        }
+        // Drop idle locks (held only by the map) once the map grows large.
+        if map.len() >= self.max_entries {
+            map.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        map.insert(Arc::from(name.cache_key()), lock.clone());
+        lock
+    }
+
     pub async fn delete_sender_key(&self, cache_key: &str) {
         let mut state = self.sender_keys.lock().await;
         state.delete(cache_key);
@@ -482,7 +541,7 @@ impl SignalStoreCache {
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
             let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
 
-            let mut encode_buf = Vec::new();
+            let mut encode_buf = self.flush_encode_buf.lock().await;
             for address in &dirty_keys {
                 match state.cache.get(address.as_ref()) {
                     Some(SessionEntry::Present(record)) => {
@@ -585,5 +644,40 @@ impl SignalStoreCache {
         self.sessions.lock().await.clear();
         self.identities.lock().await.clear();
         self.sender_keys.lock().await.clear();
+    }
+}
+
+#[cfg(test)]
+mod sender_key_lock_tests {
+    use super::*;
+    use crate::libsignal::store::sender_key_name::SenderKeyName;
+
+    #[tokio::test]
+    async fn same_name_shares_one_lock() {
+        let cache = SignalStoreCache::new();
+        let a = SenderKeyName::from_parts("g1@g.us", "u1@s.whatsapp.net:0");
+        let b = SenderKeyName::from_parts("g2@g.us", "u1@s.whatsapp.net:0");
+
+        let l1 = cache.sender_key_lock(&a).await;
+        let l2 = cache.sender_key_lock(&a).await;
+        let l3 = cache.sender_key_lock(&b).await;
+
+        assert!(Arc::ptr_eq(&l1, &l2), "same name must share one lock");
+        assert!(!Arc::ptr_eq(&l1, &l3), "different names must not share");
+    }
+
+    #[tokio::test]
+    async fn same_name_lock_is_mutually_exclusive() {
+        let cache = SignalStoreCache::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+        let lock = cache.sender_key_lock(&name).await;
+
+        let guard = lock.lock().await;
+        assert!(
+            lock.try_lock().is_none(),
+            "held lock must block a second acquire"
+        );
+        drop(guard);
+        assert!(lock.try_lock().is_some(), "released lock must reacquire");
     }
 }

@@ -5,7 +5,7 @@ use crate::store::commands::DeviceCommand;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::store::traits::Backend;
 use crate::types::enc_handler::EncHandler;
-use crate::types::events::{Event, EventHandler};
+use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
 use crate::types::message::MessageInfo;
 use anyhow::Result;
 use log::{info, warn};
@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 use wacore::runtime::Runtime;
+use wacore::store::DevicePropsOverride;
 use waproto::whatsapp as wa;
 
 /// Typestate marker: a required builder field has not been provided yet.
@@ -29,16 +30,24 @@ pub enum BotBuilderError {
     Other(#[from] anyhow::Error),
 }
 
+/// `message` is `Arc` so cloning the context across spawned tasks only bumps a
+/// refcount, matching the pattern used by serenity's `Context` and matrix-sdk's
+/// `Room`/`Client`.
+#[derive(Clone)]
 pub struct MessageContext {
-    pub message: Box<wa::Message>,
+    pub message: Arc<wa::Message>,
     pub info: MessageInfo,
     pub client: Arc<Client>,
 }
 
 impl MessageContext {
     pub fn from_parts(message: &wa::Message, info: &MessageInfo, client: Arc<Client>) -> Self {
+        Self::from_arc(Arc::new(message.clone()), info, client)
+    }
+
+    pub fn from_arc(message: Arc<wa::Message>, info: &MessageInfo, client: Arc<Client>) -> Self {
         Self {
-            message: Box::new(message.clone()),
+            message,
             info: info.clone(),
             client,
         }
@@ -46,7 +55,7 @@ impl MessageContext {
 
     pub fn from_event(event: &Event, client: Arc<Client>) -> Option<Self> {
         let (msg, info) = event.as_message()?;
-        Some(Self::from_parts(msg, info, client))
+        Some(Self::from_arc(Arc::clone(msg), info, client))
     }
 
     pub async fn send_message(
@@ -65,6 +74,20 @@ impl MessageContext {
             &self.info.source.chat,
             &self.message,
         )
+    }
+
+    /// Referential [`wa::MessageKey`] for [`wa::message::ReactionMessage::key`].
+    /// Sender-side revokes have a different shape; use [`Client::revoke_message`].
+    pub fn message_key(&self) -> wa::MessageKey {
+        use wacore_binary::JidExt;
+        let needs_participant =
+            self.info.source.is_group || self.info.source.chat.is_status_broadcast();
+        wa::MessageKey {
+            remote_jid: Some(self.info.source.chat.to_string()),
+            from_me: Some(self.info.source.is_from_me),
+            id: Some(self.info.id.clone()),
+            participant: needs_participant.then(|| self.info.source.sender.to_string()),
+        }
     }
 
     pub async fn edit_message(
@@ -96,15 +119,23 @@ impl MessageContext {
 type EventHandlerCallback =
     Arc<dyn Fn(Arc<Event>, Arc<Client>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// The user callback bundled with the set of event kinds it wants. Carrying the
+/// interest here lets the bus skip materializing (and boxing) events the
+/// callback ignores.
+struct RegisteredHandler {
+    callback: EventHandlerCallback,
+    interest: EventInterest,
+}
+
 struct BotEventHandler {
     client: Arc<Client>,
-    event_handler: Option<EventHandlerCallback>,
+    event_handler: Option<RegisteredHandler>,
 }
 
 impl EventHandler for BotEventHandler {
     fn handle_event(&self, event: Arc<Event>) {
         if let Some(handler) = &self.event_handler {
-            let handler_clone = handler.clone();
+            let handler_clone = handler.callback.clone();
             let client_clone = self.client.clone();
 
             self.client
@@ -114,6 +145,13 @@ impl EventHandler for BotEventHandler {
                 }))
                 .detach();
         }
+    }
+
+    fn interest(&self) -> EventInterest {
+        self.event_handler
+            .as_ref()
+            .map(|h| h.interest)
+            .unwrap_or(EventInterest::none())
     }
 }
 
@@ -145,7 +183,7 @@ impl std::future::Future for BotHandle {
 pub struct Bot {
     client: Arc<Client>,
     sync_task_receiver: Option<async_channel::Receiver<crate::sync_task::MajorSyncTask>>,
-    event_handler: Option<EventHandlerCallback>,
+    event_handler: Option<RegisteredHandler>,
     pair_code_options: Option<PairCodeOptions>,
 }
 
@@ -251,14 +289,10 @@ pub struct BotBuilder<B = Missing, T = Missing, H = Missing, R = Missing> {
     http_client: Option<Arc<dyn crate::http::HttpClient>>,
     runtime: Option<Arc<dyn Runtime>>,
     // Optional fields
-    event_handler: Option<EventHandlerCallback>,
+    event_handler: Option<RegisteredHandler>,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     override_version: Option<(u32, u32, u32)>,
-    os_info: Option<(
-        Option<String>,
-        Option<wa::device_props::AppVersion>,
-        Option<wa::device_props::PlatformType>,
-    )>,
+    device_props_override: Option<DevicePropsOverride>,
     pair_code_options: Option<PairCodeOptions>,
     skip_history_sync: bool,
     initial_push_name: Option<String>,
@@ -276,7 +310,7 @@ impl BotBuilder<Missing, Missing, Missing, Missing> {
             event_handler: None,
             custom_enc_handlers: HashMap::new(),
             override_version: None,
-            os_info: None,
+            device_props_override: None,
             pair_code_options: None,
             skip_history_sync: false,
             initial_push_name: None,
@@ -312,7 +346,7 @@ impl<T, H, R> BotBuilder<Missing, T, H, R> {
             event_handler: self.event_handler,
             custom_enc_handlers: self.custom_enc_handlers,
             override_version: self.override_version,
-            os_info: self.os_info,
+            device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
@@ -351,7 +385,7 @@ impl<B, H, R> BotBuilder<B, Missing, H, R> {
             event_handler: self.event_handler,
             custom_enc_handlers: self.custom_enc_handlers,
             override_version: self.override_version,
-            os_info: self.os_info,
+            device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
@@ -389,7 +423,7 @@ impl<B, T, R> BotBuilder<B, T, Missing, R> {
             event_handler: self.event_handler,
             custom_enc_handlers: self.custom_enc_handlers,
             override_version: self.override_version,
-            os_info: self.os_info,
+            device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
@@ -412,7 +446,7 @@ impl<B, T, H> BotBuilder<B, T, H, Missing> {
             event_handler: self.event_handler,
             custom_enc_handlers: self.custom_enc_handlers,
             override_version: self.override_version,
-            os_info: self.os_info,
+            device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
@@ -425,14 +459,35 @@ impl<B, T, H> BotBuilder<B, T, H, Missing> {
 // ── Optional-field setters (available in any state) ──────────────────────
 
 impl<B, T, H, R> BotBuilder<B, T, H, R> {
-    pub fn on_event<F, Fut>(mut self, handler: F) -> Self
+    /// Register a handler that receives every event kind.
+    pub fn on_event<F, Fut>(self, handler: F) -> Self
     where
         F: Fn(Arc<Event>, Arc<Client>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.event_handler = Some(Arc::new(move |event, client| {
-            Box::pin(handler(event, client))
-        }));
+        self.register_event_handler(EventInterest::ALL, handler)
+    }
+
+    /// Register a handler that receives only the given event kinds. The bus
+    /// skips materializing (and boxing the handler future for) every other
+    /// kind, so a narrowly-scoped bot does not pay for events it ignores.
+    pub fn on_event_for<F, Fut>(self, kinds: &[EventKind], handler: F) -> Self
+    where
+        F: Fn(Arc<Event>, Arc<Client>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.register_event_handler(EventInterest::of(kinds), handler)
+    }
+
+    fn register_event_handler<F, Fut>(mut self, interest: EventInterest, handler: F) -> Self
+    where
+        F: Fn(Arc<Event>, Arc<Client>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.event_handler = Some(RegisteredHandler {
+            callback: Arc::new(move |event, client| Box::pin(handler(event, client))),
+            interest,
+        });
         self
     }
 
@@ -477,52 +532,24 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// Override the device properties sent to WhatsApp servers.
     /// This allows customizing how your device appears on the linked devices list.
     ///
-    /// # Arguments
-    /// * `os_name` - Optional OS name (e.g., "macOS", "Windows", "Linux")
-    /// * `version` - Optional app version as AppVersion struct
-    /// * `platform_type` - Optional platform type that determines the device name shown
-    ///   on the phone's linked devices list (e.g., Chrome, Firefox, Safari, Desktop)
-    ///
-    /// **Important**: The `platform_type` determines what device name is shown on the phone.
-    /// Common values: `Chrome`, `Firefox`, `Safari`, `Edge`, `Desktop`, `Ipad`, etc.
-    /// If not set, defaults to `Unknown` which shows as "Unknown device".
-    ///
-    /// You can pass `None` for any parameter to keep the default value.
+    /// `platform_type` controls the display name in Linked Devices; defaults
+    /// to `Unknown` ("Unknown device"). Only applied on the initial pairing.
     ///
     /// # Example
     /// ```rust,ignore
-    /// use waproto::whatsapp::device_props::{self, PlatformType};
+    /// use waproto::whatsapp::device_props::PlatformType;
+    /// use wacore::store::DevicePropsOverride;
     ///
-    /// // Show as "Chrome" on linked devices
-    /// let bot = Bot::builder()
+    /// Bot::builder()
     ///     .with_backend(backend)
     ///     .with_device_props(
-    ///         Some("macOS".to_string()),
-    ///         Some(device_props::AppVersion {
-    ///             primary: Some(2),
-    ///             secondary: Some(0),
-    ///             tertiary: Some(0),
-    ///             ..Default::default()
-    ///         }),
-    ///         Some(PlatformType::Chrome),
-    ///     )
-    ///     .build()
-    ///     .await?;
-    ///
-    /// // Show as "Desktop" on linked devices
-    /// let bot = Bot::builder()
-    ///     .with_backend(backend)
-    ///     .with_device_props(None, None, Some(PlatformType::Desktop))
-    ///     .build()
-    ///     .await?;
+    ///         DevicePropsOverride::new()
+    ///             .with_os("macOS")
+    ///             .with_platform_type(PlatformType::Chrome),
+    ///     );
     /// ```
-    pub fn with_device_props(
-        mut self,
-        os_name: Option<String>,
-        version: Option<wa::device_props::AppVersion>,
-        platform_type: Option<wa::device_props::PlatformType>,
-    ) -> Self {
-        self.os_info = Some((os_name, version, platform_type));
+    pub fn with_device_props(mut self, override_: DevicePropsOverride) -> Self {
+        self.device_props_override = Some(override_);
         self
     }
 
@@ -537,18 +564,19 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     ///
     /// # Example
     /// ```rust,ignore
-    /// use whatsapp_rust::pair_code::{PairCodeOptions, PlatformId};
+    /// use whatsapp_rust::pair_code::PairCodeOptions;
     ///
+    /// // Platform identity is derived from `DeviceProps` configured via
+    /// // `Bot::builder().with_device_props(...)`. Explicit overrides below
+    /// // are optional — omit them to let derivation do the right thing.
     /// let bot = Bot::builder()
     ///     .with_backend(backend)
     ///     .with_transport_factory(transport)
     ///     .with_http_client(http_client)
     ///     .with_pair_code(PairCodeOptions {
     ///         phone_number: "15551234567".to_string(),
-    ///         show_push_notification: true,
     ///         custom_code: Some("ABCD1234".to_string()),
-    ///         platform_id: PlatformId::Chrome,
-    ///         platform_display: "Chrome (Linux)".to_string(),
+    ///         ..Default::default()
     ///     })
     ///     .on_event(|event, client| async move {
     ///         match &*event {
@@ -652,10 +680,6 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
                 .map_err(|e| anyhow::anyhow!("Failed to create persistence manager: {}", e))?,
         );
 
-        persistence_manager
-            .clone()
-            .run_background_saver(runtime.clone(), std::time::Duration::from_secs(30));
-
         // Apply initial push name if specified (for deterministic mock server phone assignment)
         if let Some(name) = self.initial_push_name {
             persistence_manager
@@ -663,24 +687,18 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
                 .await;
         }
 
-        // Apply device props override if specified
-        if let Some((os_name, version, platform_type)) = self.os_info {
-            info!(
-                "Applying device props override: os={:?}, version={:?}, platform_type={:?}",
-                os_name, version, platform_type
-            );
+        if let Some(override_) = self.device_props_override
+            && !override_.is_empty()
+        {
+            info!("Applying device props override: {:?}", override_);
             persistence_manager
-                .process_command(DeviceCommand::SetDeviceProps(
-                    os_name,
-                    version,
-                    platform_type,
-                ))
+                .process_command(DeviceCommand::SetDeviceProps(override_))
                 .await;
         }
 
         info!("Creating client...");
         let (client, sync_task_receiver) = Client::new_with_cache_config(
-            runtime,
+            runtime.clone(),
             persistence_manager.clone(),
             transport_factory,
             http_client,
@@ -688,6 +706,16 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             self.cache_config,
         )
         .await;
+
+        let saver_handle = persistence_manager.run_background_saver(
+            runtime,
+            std::time::Duration::from_secs(30),
+            client.shutdown_signal(),
+        );
+        // Tie the saver task to Arc<Client> so extracting client() and outliving
+        // Bot keeps periodic persistence alive. Client::drop on the last Arc
+        // drops the AbortHandle and aborts the task.
+        let _ = client.saver_handle.set(saver_handle);
 
         // Register custom enc handlers
         for (enc_type, handler) in self.custom_enc_handlers {
@@ -882,7 +910,11 @@ mod tests {
             .with_backend(backend)
             .with_transport_factory(transport)
             .with_http_client(http_client)
-            .with_device_props(Some(custom_os.clone()), Some(custom_version), None)
+            .with_device_props(
+                DevicePropsOverride::new()
+                    .with_os(custom_os.clone())
+                    .with_version(custom_version),
+            )
             .with_runtime(TokioRuntime)
             .build()
             .await
@@ -909,7 +941,7 @@ mod tests {
             .with_backend(backend)
             .with_transport_factory(transport)
             .with_http_client(http_client)
-            .with_device_props(Some(custom_os.clone()), None, None)
+            .with_device_props(DevicePropsOverride::new().with_os(custom_os.clone()))
             .with_runtime(TokioRuntime)
             .build()
             .await
@@ -945,7 +977,7 @@ mod tests {
             .with_backend(backend)
             .with_http_client(http_client)
             .with_transport_factory(transport)
-            .with_device_props(None, Some(custom_version), None)
+            .with_device_props(DevicePropsOverride::new().with_version(custom_version))
             .with_runtime(TokioRuntime)
             .build()
             .await
@@ -974,7 +1006,10 @@ mod tests {
             .with_backend(backend)
             .with_transport_factory(transport)
             .with_http_client(http_client)
-            .with_device_props(None, None, Some(wa::device_props::PlatformType::Chrome))
+            .with_device_props(
+                DevicePropsOverride::new()
+                    .with_platform_type(wa::device_props::PlatformType::Chrome),
+            )
             .with_runtime(TokioRuntime)
             .build()
             .await
@@ -1020,9 +1055,10 @@ mod tests {
             .with_transport_factory(transport)
             .with_http_client(http_client)
             .with_device_props(
-                Some(custom_os.clone()),
-                Some(custom_version),
-                Some(custom_platform),
+                DevicePropsOverride::new()
+                    .with_os(custom_os.clone())
+                    .with_version(custom_version)
+                    .with_platform_type(custom_platform),
             )
             .with_runtime(TokioRuntime)
             .build()
@@ -1077,5 +1113,29 @@ mod tests {
             .expect("Failed to build bot");
 
         assert!(!bot.client().skip_history_sync_enabled());
+    }
+
+    #[tokio::test]
+    async fn from_arc_does_not_deep_clone() {
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        let original = Arc::new(wa::Message {
+            conversation: Some("ping".to_string()),
+            ..Default::default()
+        });
+        let original_ptr = Arc::as_ptr(&original);
+
+        let ctx =
+            MessageContext::from_arc(Arc::clone(&original), &MessageInfo::default(), bot.client());
+
+        assert!(std::ptr::eq(Arc::as_ptr(&ctx.message), original_ptr));
     }
 }

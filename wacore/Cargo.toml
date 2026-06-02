@@ -1,6 +1,6 @@
 [package]
 name = "wacore"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
@@ -12,13 +12,15 @@ default = ["simd"]
 simd = ["wacore-appstate/simd"]
 debug-diagnostics = []
 debug-snapshots = []
+# Disables XEdDSA verification of the server's Noise cert chain. Required
+# for the e2e mock server (self-signed certs). NEVER enable in prod.
+danger-skip-cert-chain-verify = ["wacore-noise/danger-skip-cert-chain-verify"]
 # Enable JS-based random number generation for wasm32 targets.
 # Activates getrandom's wasm_js backend so rand works in the browser.
 js = ["getrandom/wasm_js"]
 
 [dependencies]
 aes = { workspace = true }
-aes-gcm = { workspace = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }
@@ -34,9 +36,9 @@ getrandom = { workspace = true, optional = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
+itoa = { workspace = true }
 log = { workspace = true }
 md5 = "0.8.0"
-once_cell = { version = "1.21", default-features = false, features = ["std"] }
 portable-atomic = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
@@ -45,6 +47,7 @@ serde-big-array = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 typed-builder = "0.23"
 wacore-appstate = { workspace = true }
@@ -55,7 +58,8 @@ wacore-noise = { workspace = true }
 waproto = { workspace = true }
 
 [dev-dependencies]
-futures = { workspace = true, features = ["executor"] }
+aes-gcm = { workspace = true }
+futures = { workspace = true, features = ["executor", "thread-pool"] }
 iai-callgrind = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 
@@ -66,3 +70,6 @@ harness = false
 [[bench]]
 name = "send_receive_benchmark"
 harness = false
+
+[lints]
+workspace = true

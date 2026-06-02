@@ -1,6 +1,7 @@
 //! Sender key tracking and message cache methods for Client.
 
 use anyhow::Result;
+use wacore::types::message::ChatMessageId;
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
@@ -14,22 +15,26 @@ impl Client {
         has_key: bool,
         exclude_own_devices: bool,
     ) -> Result<()> {
-        let (own_lid_user, own_pn_user) = if exclude_own_devices {
-            let snapshot = self.persistence_manager.get_device_snapshot().await;
-            (
-                snapshot.lid.as_ref().map(|j| j.user.clone()),
-                snapshot.pn.as_ref().map(|j| j.user.clone()),
-            )
+        let snapshot = if exclude_own_devices {
+            Some(self.persistence_manager.get_device_snapshot().await)
         } else {
-            (None, None)
+            None
         };
+        let own_lid_user = snapshot
+            .as_ref()
+            .and_then(|s| s.lid.as_ref())
+            .map(|j| j.user.as_str());
+        let own_pn_user = snapshot
+            .as_ref()
+            .and_then(|s| s.pn.as_ref())
+            .map(|j| j.user.as_str());
 
         let device_ids: Vec<String> = device_jids
             .iter()
             .filter(|jid| {
                 !exclude_own_devices
-                    || !(own_lid_user.as_deref().is_some_and(|u| u == jid.user)
-                        || own_pn_user.as_deref().is_some_and(|u| u == jid.user))
+                    || !(own_lid_user.is_some_and(|u| u == jid.user)
+                        || own_pn_user.is_some_and(|u| u == jid.user))
             })
             .map(ToString::to_string)
             .collect();
@@ -62,39 +67,144 @@ impl Client {
         Ok(())
     }
 
+    /// Forward-secrecy rotation when participants leave a group. Mirrors WA
+    /// Web's `removeParticipantInfo` (`GroupParticipantHelpers.js`): if any
+    /// removed user had `has_key=true`, delete the bot's own sender key for
+    /// the group and wipe `sender_key_devices` so the next send takes the
+    /// `force_skdm=true` path (`!key_exists`) and redistributes to all
+    /// remaining participants.
+    pub(crate) async fn rotate_sender_key_on_participant_remove(
+        &self,
+        group_jid: &str,
+        removed_user_ids: &[&str],
+    ) {
+        if removed_user_ids.is_empty() {
+            return;
+        }
+
+        // Read failure → rotate anyway. Better to pay the redistribute cost
+        // than leave the sender key in place after a removal we couldn't audit.
+        let (rows, read_failed) = match self
+            .persistence_manager
+            .get_sender_key_devices(group_jid)
+            .await
+        {
+            Ok(r) => (r, false),
+            Err(e) => {
+                log::warn!(
+                    "rotate_sender_key_on_participant_remove: read failed for {group_jid}: {e} \
+                     — rotating conservatively"
+                );
+                (Vec::new(), true)
+            }
+        };
+
+        let any_had_key = rows.iter().any(|(jid_str, has_key)| {
+            *has_key
+                && jid_str
+                    .parse::<Jid>()
+                    .ok()
+                    .is_some_and(|jid| removed_user_ids.iter().any(|u| *u == jid.user.as_str()))
+        });
+        if !read_failed && !any_had_key {
+            return;
+        }
+
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        use wacore::types::jid::JidExt;
+        let snapshot = self.persistence_manager.get_device_snapshot().await;
+        for own_jid in snapshot.lid.iter().chain(snapshot.pn.iter()) {
+            let sk_name =
+                SenderKeyName::from_parts(group_jid, own_jid.to_protocol_address().as_str());
+            self.signal_cache
+                .delete_sender_key(sk_name.cache_key())
+                .await;
+        }
+        self.flush_signal_cache_logged("rotate_sender_key_on_participant_remove", None)
+            .await;
+
+        if let Err(e) = self
+            .persistence_manager
+            .clear_sender_key_devices(group_jid)
+            .await
+        {
+            log::warn!("rotate_sender_key_on_participant_remove: clear DB failed: {e}");
+        }
+        self.sender_key_device_cache.invalidate(group_jid).await;
+    }
+
     /// Take a sent message for retry handling. Checks L1 cache first (if enabled),
-    /// then falls back to DB. Matches WA Web's getMessageTable().get() pattern.
-    pub(crate) async fn take_recent_message(&self, to: &Jid, id: &str) -> Option<wa::Message> {
+    /// then falls back to DB. On miss, tries an alternate PN/LID key to handle
+    /// mapping changes between send time and retry time (WAWebLidMigrationUtils
+    /// `getAlternateMsgKey`).
+    /// Returns `(message, alternate_chat)`. When the message was found via the
+    /// alternate PN/LID key, `alternate_chat` contains the namespace that
+    /// matched -- the caller should use it for session operations instead of
+    /// `resolve_encryption_jid` (which would map back to the primary).
+    pub(crate) async fn take_recent_message(
+        &self,
+        to: &Jid,
+        id: &str,
+    ) -> Option<(wa::Message, Option<Jid>)> {
+        let primary_key = self.make_chat_message_id(to, id).await;
+        if let Some(msg) = self.try_take_by_key(&primary_key).await {
+            return Some((msg, None));
+        }
+
+        // Primary miss -- try alternate PN<->LID key.
+        // If resolve_encryption_jid changed the namespace (PN→LID), the
+        // original `to` is already the alternate -- skip the cache lookup.
+        // Otherwise (LID input), swap via cache to try the PN form.
+        let alt_chat = if primary_key.chat.server != to.server {
+            Some(to.clone())
+        } else {
+            self.swap_pn_lid_namespace(&primary_key.chat).await
+        };
+
+        if let Some(alt_chat) = alt_chat {
+            log::debug!(
+                "Primary key miss for {}:{}, trying alternate {}",
+                primary_key.chat,
+                id,
+                alt_chat
+            );
+            let alt_key = ChatMessageId {
+                chat: alt_chat,
+                id: primary_key.id,
+            };
+            if let Some(msg) = self.try_take_by_key(&alt_key).await {
+                return Some((msg, Some(alt_key.chat)));
+            }
+        }
+
+        None
+    }
+
+    /// Look up and consume a message by exact `ChatMessageId` (L1 cache then DB).
+    async fn try_take_by_key(&self, key: &ChatMessageId) -> Option<wa::Message> {
         use prost::Message;
-        let key = self.make_chat_message_id(to, id).await;
         let chat_str = key.chat.to_string();
         let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
 
         // L1 cache check (if capacity > 0)
-        if has_l1_cache && let Some(bytes) = self.recent_messages.remove(&key).await {
+        if has_l1_cache && let Some(bytes) = self.recent_messages.remove(key).await {
             if let Ok(msg) = wa::Message::decode(bytes.as_slice()) {
                 // Cache hit — consume the DB row in the background to avoid orphans.
-                // Note: if the background DB write from add_recent_message hasn't completed
-                // yet, this delete may run first and the write creates an orphan. This is
-                // harmless — periodic cleanup (sent_message_ttl_secs) purges it. The race
-                // window is negligible since retry receipts arrive seconds after send.
                 let backend = self.persistence_manager.backend();
-                let cs = chat_str.clone();
                 let mid = key.id.clone();
                 self.runtime
                     .spawn(Box::pin(async move {
-                        if let Err(e) = backend.take_sent_message(&cs, &mid).await {
-                            log::warn!("Failed to clean up sent message {cs}:{mid}: {e}");
+                        if let Err(e) = backend.take_sent_message(&chat_str, &mid).await {
+                            log::warn!("Failed to clean up sent message {chat_str}:{mid}: {e}");
                         }
                     }))
                     .detach();
                 return Some(msg);
             }
-            // Cache decode failed — fall through to DB
             log::warn!(
                 "Failed to decode cached message for {}:{}, trying DB",
-                to,
-                id
+                key.chat,
+                key.id
             );
         }
 
@@ -108,7 +218,12 @@ impl Client {
             Ok(Some(bytes)) => match wa::Message::decode(bytes.as_slice()) {
                 Ok(msg) => Some(msg),
                 Err(e) => {
-                    log::warn!("Failed to decode DB message for {}:{}: {}", to, id, e);
+                    log::warn!(
+                        "Failed to decode DB message for {}:{}: {}",
+                        key.chat,
+                        key.id,
+                        e
+                    );
                     None
                 }
             },
@@ -116,8 +231,8 @@ impl Client {
             Err(e) => {
                 log::warn!(
                     "Failed to read sent message from DB for {}:{}: {}",
-                    to,
-                    id,
+                    key.chat,
+                    key.id,
                     e
                 );
                 None
@@ -136,14 +251,22 @@ impl Client {
         let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
 
         if has_l1_cache {
-            // L1 cache serves reads immediately; DB write can be backgrounded
+            // L1 cache serves reads immediately; DB write can be backgrounded.
+            // Share the serialized bytes via Arc so the cache and the DB task
+            // hold the same buffer instead of memcpy-ing the whole message.
             let chat_str = key.chat.to_string();
             let msg_id = key.id.clone();
-            self.recent_messages.insert(key, bytes.clone()).await;
+            let shared = std::sync::Arc::new(bytes);
+            self.recent_messages
+                .insert(key, std::sync::Arc::clone(&shared))
+                .await;
             let backend = self.persistence_manager.backend();
             self.runtime
                 .spawn(Box::pin(async move {
-                    if let Err(e) = backend.store_sent_message(&chat_str, &msg_id, &bytes).await {
+                    if let Err(e) = backend
+                        .store_sent_message(&chat_str, &msg_id, &shared)
+                        .await
+                    {
                         log::warn!("Failed to store sent message to DB: {e}");
                     }
                 }))

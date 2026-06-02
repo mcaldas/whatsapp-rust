@@ -4,12 +4,13 @@
 //! Uses MEX (GraphQL) for metadata/management and standard IQ for message operations.
 //! Newsletter messages are plaintext (no Signal E2E encryption).
 
-use wacore::StringEnum;
+use wacore::WireEnum;
 
 use crate::client::Client;
 use crate::features::mex::{MexError, MexRequest};
 use prost::Message as ProtoMessage;
 use serde_json::json;
+use wacore::iq::mex_ids::newsletter as newsletter_docs;
 use wacore::iq::newsletter::NEWSLETTER_XMLNS;
 use wacore::request::InfoQuery;
 use wacore_binary::Jid;
@@ -19,24 +20,24 @@ use waproto::whatsapp as wa;
 
 // Types
 
-#[derive(Debug, Clone, PartialEq, Eq, StringEnum)]
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
 #[non_exhaustive]
 pub enum NewsletterMessageType {
-    #[str = "text"]
+    #[wire = "text"]
     Text,
-    #[str = "media"]
+    #[wire = "media"]
     Media,
-    #[str = "reaction"]
+    #[wire = "reaction"]
     Reaction,
-    #[str = "revoke"]
+    #[wire = "revoke"]
     Revoke,
-    #[str = "poll_creation"]
+    #[wire = "poll_creation"]
     PollCreation,
-    #[str = "poll_vote"]
+    #[wire = "poll_vote"]
     PollVote,
-    #[str = "edit"]
+    #[wire = "edit"]
     Edit,
-    #[string_fallback]
+    #[wire_fallback]
     Other(String),
 }
 
@@ -123,7 +124,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .query(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::LIST_SUBSCRIBED,
+                doc: newsletter_docs::LIST_SUBSCRIBED,
                 variables: json!({}),
             })
             .await?;
@@ -146,7 +147,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .query(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::FETCH_METADATA,
+                doc: newsletter_docs::FETCH_METADATA,
                 variables: json!({
                     "input": {
                         "key": jid.to_string(),
@@ -190,7 +191,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .mutate(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::CREATE,
+                doc: newsletter_docs::CREATE,
                 variables: json!({ "input": input }),
             })
             .await?;
@@ -215,7 +216,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .mutate(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::JOIN,
+                doc: newsletter_docs::JOIN,
                 variables: json!({
                     "newsletter_id": jid.to_string()
                 }),
@@ -241,7 +242,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .mutate(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::LEAVE,
+                doc: newsletter_docs::LEAVE,
                 variables: json!({
                     "newsletter_id": jid.to_string()
                 }),
@@ -279,7 +280,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .mutate(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::UPDATE,
+                doc: newsletter_docs::UPDATE,
                 variables: json!({
                     "newsletter_id": jid.to_string(),
                     "updates": updates
@@ -309,7 +310,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .query(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::FETCH_METADATA,
+                doc: newsletter_docs::FETCH_METADATA,
                 variables: json!({
                     "input": {
                         "key": invite_code,
@@ -374,18 +375,9 @@ impl<'a> Newsletter<'a> {
         server_id: u64,
         reaction: &str,
     ) -> Result<(), anyhow::Error> {
-        let request_id = self.client.generate_message_id().await;
-
-        let stanza = NodeBuilder::new("message")
-            .attr("to", jid)
-            .attr("type", "reaction")
-            .attr("id", &request_id)
-            .attr("server_id", server_id.to_string())
-            .children([NodeBuilder::new("reaction").attr("code", reaction).build()])
-            .build();
-
-        self.client.send_node(stanza).await?;
-        Ok(())
+        self.client
+            .send_server_reaction(jid, server_id, reaction)
+            .await
     }
 
     /// Fetch message history from a newsletter.
@@ -398,9 +390,9 @@ impl<'a> Newsletter<'a> {
         count: u32,
         before: Option<u64>,
     ) -> Result<Vec<NewsletterMessage>, anyhow::Error> {
-        let mut messages_node = NodeBuilder::new("messages").attr("count", count.to_string());
+        let mut messages_node = NodeBuilder::new("messages").attr("count", count);
         if let Some(before_id) = before {
-            messages_node = messages_node.attr("before", before_id.to_string());
+            messages_node = messages_node.attr("before", before_id);
         }
 
         let iq = InfoQuery::get(
@@ -428,9 +420,7 @@ fn parse_newsletter_metadata(value: &serde_json::Value) -> Result<NewsletterMeta
     let jid_str = value["id"]
         .as_str()
         .ok_or_else(|| MexError::PayloadParsing("missing newsletter id".into()))?;
-    let jid: Jid = jid_str
-        .parse()
-        .map_err(|e| MexError::PayloadParsing(format!("invalid newsletter JID: {e}")))?;
+    let jid: Jid = jid_str.parse()?;
 
     let thread = &value["thread_metadata"];
 

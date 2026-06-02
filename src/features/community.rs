@@ -9,11 +9,11 @@ use crate::features::groups::GroupParticipant;
 use crate::features::mex::{MexError, MexRequest};
 use log::warn;
 use serde_json::json;
-use wacore::iq::community::mex_docs;
 use wacore::iq::groups::{
     DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateIq, GroupCreateOptions,
     JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
+use wacore::iq::mex_ids::community as community_docs;
 use wacore_binary::Jid;
 
 // Types
@@ -60,10 +60,9 @@ impl CreateCommunityOptions {
 }
 
 /// Result of creating a community.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CreateCommunityResult {
-    /// JID of the created community parent group.
-    pub gid: Jid,
+    pub metadata: GroupMetadata,
 }
 
 /// A subgroup within a community.
@@ -135,22 +134,23 @@ impl<'a> Community<'a> {
             ..Default::default()
         };
 
-        let gid = self
+        let group = self
             .client
             .execute(GroupCreateIq::new(create_options))
             .await?;
+        let mut metadata = GroupMetadata::from(group);
 
-        // Set description via follow-up IQ if provided
         if let Some(desc_text) = description
             && let Ok(desc) = wacore::iq::groups::GroupDescription::new(&desc_text)
         {
             self.client
                 .groups()
-                .set_description(&gid, Some(desc), None)
+                .set_description(&metadata.id, Some(desc), None)
                 .await?;
+            metadata.description = Some(desc_text);
         }
 
-        Ok(CreateCommunityResult { gid })
+        Ok(CreateCommunityResult { metadata })
     }
 
     /// Deactivate (delete) a community. Subgroups are unlinked but not deleted.
@@ -231,7 +231,7 @@ impl<'a> Community<'a> {
             .client
             .mex()
             .query(MexRequest {
-                doc_id: mex_docs::FETCH_ALL_SUBGROUPS,
+                doc: community_docs::FETCH_ALL_SUBGROUPS,
                 variables: json!({
                     "group_id": community_jid.to_string()
                 }),
@@ -278,7 +278,7 @@ impl<'a> Community<'a> {
             .client
             .mex()
             .query(MexRequest {
-                doc_id: mex_docs::FETCH_SUBGROUP_PARTICIPANT_COUNT,
+                doc: community_docs::FETCH_SUBGROUP_PARTICIPANT_COUNT,
                 variables: json!({
                     "input": {
                         "group_jid": community_jid.to_string()
