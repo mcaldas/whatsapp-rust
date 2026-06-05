@@ -1302,6 +1302,18 @@ impl Client {
             let recipient_bare = self.resolve_encryption_jid(&to).await.into_non_ad();
             let recipient_is_lid = recipient_bare.is_lid();
 
+            // The outer `<message to>`, the DeviceSentMessage destinationJid, and
+            // the reporting-token remote jid must share the participants' namespace.
+            // WAWebSendMsgCreateFanoutStanza builds the whole stanza from one
+            // CHAT_JID, so for a LID-addressed peer the `to` is the resolved LID,
+            // not the caller's PN. A PN `to` over LID participants is rejected
+            // wholesale by the server with `ack error="400"`.
+            let stanza_to = if recipient_is_lid {
+                recipient_bare.clone()
+            } else {
+                to.clone()
+            };
+
             // Local registry first; network warm only on miss to avoid
             // unnecessary LID-migration side effects from get_user_devices
             let mut recipient_cached = self.get_devices_from_registry(&recipient_bare).await;
@@ -1409,7 +1421,7 @@ impl Client {
                 own_jid,
                 device_snapshot.lid.as_ref(),
                 device_snapshot.account.as_deref(),
-                to,
+                stanza_to,
                 message,
                 request_id,
                 edit,
@@ -3648,6 +3660,436 @@ mod tests {
                 .as_ref(),
             "1"
         );
+    }
+
+    #[tokio::test]
+    async fn stanza_type_override_sets_wire_type_attr() {
+        let client = crate::test_utils::create_test_client_with_name("stanza_type_override").await;
+        let peer: Jid = "100000000000003@s.whatsapp.net".parse().unwrap();
+        seed_peer_send_state(&client, &peer).await;
+
+        let request_id = "STANZA_TYPE_OVERRIDE_1";
+        let waiter = client
+            .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
+        let msg =
+            pdo_request_message(wa::message::PeerDataOperationRequestType::HistorySyncOnDemand);
+
+        // Poll is never the type for this message; it can only come from the override.
+        let result = client
+            .send_message_impl(
+                peer,
+                &msg,
+                Some(request_id.to_string()),
+                true,
+                false,
+                None,
+                vec![],
+                Some(wacore::send::StanzaType::Poll),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "test client has no socket; send should fail after stanza capture"
+        );
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sent node should be captured")
+            .expect("sent node waiter should resolve");
+        assert_eq!(
+            node.attrs().optional_string("type").unwrap().as_ref(),
+            wacore::send::StanzaType::Poll.as_wire()
+        );
+    }
+
+    /// Regression for #730: a DM to a LID-mapped peer must address the outer
+    /// `<message to>` by LID, matching the LID `<participants>`. Pre-fix the
+    /// outer `to` kept the caller's PN, so a PN-to over LID participants was
+    /// rejected wholesale by the server with `ack error="400"` and never
+    /// delivered (while the send still returned Ok). WAWebSendMsgCreateFanoutStanza
+    /// builds the whole stanza from one CHAT_JID (the LID after migration).
+    #[tokio::test]
+    async fn dm_to_lid_mapped_peer_addresses_outer_to_by_lid() {
+        use wacore::libsignal::protocol::{
+            IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
+            process_prekey_bundle,
+        };
+
+        let client = crate::test_utils::create_test_client_with_name("lid_dm_to").await;
+
+        // A LID-addressed DM requires the device's own PN and LID to be known.
+        let own_pn: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "222222222222@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(own_pn.clone())))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(own_lid)))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetAccount(Some(peer_test_account_proto())))
+            .await;
+
+        // The peer is LID-mapped: resolve_encryption_jid must switch PN to LID.
+        let peer_pn: Jid = "100000000000777@s.whatsapp.net".parse().unwrap();
+        let peer_lid: Jid = "555000000000777@lid".parse().unwrap();
+        client
+            .add_lid_pn_mapping(
+                peer_lid.user.as_str(),
+                peer_pn.user.as_str(),
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .expect("seed lid mapping");
+
+        // Pre-seed the device registry for the peer (LID) and self (PN) so the
+        // offline send resolves the fanout from cache instead of blocking on a
+        // network device-list fetch (which would time out with no socket).
+        for user in [peer_lid.user.to_string(), own_pn.user.to_string()] {
+            client
+                .update_device_list(wacore::store::traits::DeviceListRecord {
+                    user,
+                    devices: vec![wacore::store::traits::DeviceInfo {
+                        device_id: 0,
+                        key_index: None,
+                    }],
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                })
+                .await
+                .expect("seed device registry");
+        }
+
+        // The test client never connects, so the send's `ensure_e2e_sessions`
+        // would otherwise block on `wait_for_offline_delivery_end` until timeout.
+        client.complete_offline_sync(0);
+
+        // Seed a Signal session for the peer's LID device so the offline fanout
+        // can encrypt without fetching prekeys over the (absent) socket.
+        let lid_addr = peer_lid.to_non_ad();
+        let bundle =
+            tokio::task::spawn_blocking(|| -> Result<PreKeyBundle, SignalProtocolError> {
+                let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+                let receiver = IdentityKeyPair::generate(&mut rng);
+                let spk = KeyPair::generate(&mut rng);
+                let opk = KeyPair::generate(&mut rng);
+                let sig = receiver
+                    .private_key()
+                    .calculate_signature(&spk.public_key.serialize(), &mut rng)?;
+                PreKeyBundle::new(
+                    1,
+                    1u32.into(),
+                    Some((1u32.into(), opk.public_key)),
+                    1u32.into(),
+                    spk.public_key,
+                    sig.to_vec(),
+                    *receiver.identity_key(),
+                )
+            })
+            .await
+            .expect("prekey bundle task")
+            .expect("prekey bundle");
+        {
+            let mut adapter = client.signal_adapter().await;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            process_prekey_bundle(
+                &lid_addr.to_protocol_address(),
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("peer lid session");
+        }
+
+        let request_id = "LID_DM_TO_1";
+        let waiter = client
+            .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        // Caller passes the PN form; the resolved namespace must win on the wire.
+        let result = client
+            .send_message_impl(
+                peer_pn,
+                &msg,
+                Some(request_id.to_string()),
+                false,
+                false,
+                None,
+                vec![],
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "test client has no socket; send captures the stanza then errors"
+        );
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sent node should be captured")
+            .expect("sent node waiter should resolve");
+
+        // The fix: outer `<message to>` is the LID, not the caller's PN.
+        let to_str = node
+            .attrs()
+            .optional_string("to")
+            .expect("message has a to")
+            .into_owned();
+        let to_jid: Jid = to_str.parse().expect("to parses");
+        assert!(
+            to_jid.is_lid(),
+            "outer <message to> must be LID to match the LID participants, got {to_str}"
+        );
+        assert_eq!(
+            to_jid.user.as_str(),
+            peer_lid.user.as_str(),
+            "outer to user must be the peer LID"
+        );
+
+        // Uniformity guard: every <participants>/<to> is LID too (no mix).
+        let participants = node
+            .get_optional_child("participants")
+            .expect("stanza has participants");
+        let entries = participants.children().expect("participants has children");
+        assert!(
+            !entries.is_empty(),
+            "fanout must target at least the recipient"
+        );
+        for entry in entries {
+            let pj: Jid = entry
+                .attrs()
+                .optional_string("jid")
+                .expect("participant jid")
+                .parse()
+                .expect("participant jid parses");
+            assert!(
+                pj.is_lid(),
+                "participant {pj} must be LID (uniform namespace)"
+            );
+        }
+    }
+
+    /// Newsletter JIDs must be rejected at the E2E send path root (covers the
+    /// mis-routed pin/edit/revoke producers that call send_message_impl directly).
+    #[tokio::test]
+    async fn newsletter_jid_rejected_on_e2e_send_path() {
+        let client = crate::test_utils::create_test_client_with_name("newsletter_e2e_guard").await;
+        let channel: Jid = "120363000000000001@newsletter".parse().unwrap();
+        let msg = wa::Message {
+            conversation: Some("x".to_string()),
+            ..Default::default()
+        };
+        let err = client
+            .send_message_impl(channel, &msg, None, false, false, None, vec![], None)
+            .await
+            .expect_err("newsletter JID must be rejected on the E2E send path");
+        assert!(
+            err.to_string().to_lowercase().contains("newsletter"),
+            "error should name the newsletter mis-route, got: {err}"
+        );
+    }
+
+    /// The pin producer routes through send_message_impl, so a newsletter pin is
+    /// rejected rather than building an encrypted fanout against a channel.
+    #[tokio::test]
+    async fn pin_message_rejects_newsletter() {
+        let client = crate::test_utils::create_test_client_with_name("newsletter_pin_guard").await;
+        let channel: Jid = "120363000000000002@newsletter".parse().unwrap();
+        let key = wa::MessageKey {
+            remote_jid: Some(channel.to_string()),
+            from_me: Some(true),
+            id: Some("MID".to_string()),
+            participant: None,
+        };
+        let err = client
+            .pin_message(channel, key, PinDuration::Days7)
+            .await
+            .expect_err("pinning a newsletter message must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("newsletter"),
+            "error should name the newsletter mis-route, got: {err}"
+        );
+    }
+
+    /// Newsletter edit: plaintext `<message edit="3">` keyed by server_id, with the
+    /// new content in `<plaintext>`. Keyed by the message id STRING (not server_id),
+    /// and a text edit carries no mediatype.
+    #[test]
+    fn build_newsletter_edit_node_emits_plaintext_edit() {
+        use prost::Message as _;
+        let to: Jid = "120363000000000001@newsletter".parse().unwrap();
+        let content = wa::Message {
+            conversation: Some("edited text".to_string()),
+            ..Default::default()
+        };
+        let node =
+            build_newsletter_edit_node(&to, "3EB0EDITTARGET", NewsletterEdit::Edit(&content));
+
+        let mut a = node.attrs();
+        assert_eq!(a.optional_string("id").unwrap().as_ref(), "3EB0EDITTARGET");
+        assert_eq!(a.optional_string("type").unwrap().as_ref(), "text");
+        assert_eq!(a.optional_string("edit").unwrap().as_ref(), "3");
+
+        let pt = node
+            .get_optional_child("plaintext")
+            .expect("plaintext child");
+        assert!(
+            pt.attrs().optional_string("mediatype").is_none(),
+            "a text edit must not carry a mediatype attr"
+        );
+        let bytes = match pt.content.as_ref() {
+            Some(wacore_binary::NodeContent::Bytes(b)) => b.clone(),
+            other => panic!("expected plaintext bytes, got {other:?}"),
+        };
+        let decoded = wa::Message::decode(bytes.as_slice()).expect("decode plaintext");
+        assert_eq!(decoded.conversation.as_deref(), Some("edited text"));
+    }
+
+    /// Media newsletter edit: type="media" + `<plaintext mediatype="image">`.
+    #[test]
+    fn build_newsletter_edit_node_media_edit() {
+        let to: Jid = "120363000000000001@newsletter".parse().unwrap();
+        let content = wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                caption: Some("new caption".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let node = build_newsletter_edit_node(&to, "3EB0MEDIA", NewsletterEdit::Edit(&content));
+
+        let mut a = node.attrs();
+        assert_eq!(a.optional_string("id").unwrap().as_ref(), "3EB0MEDIA");
+        assert_eq!(a.optional_string("type").unwrap().as_ref(), "media");
+        assert_eq!(a.optional_string("edit").unwrap().as_ref(), "3");
+        let pt = node
+            .get_optional_child("plaintext")
+            .expect("plaintext child");
+        assert_eq!(
+            pt.attrs().optional_string("mediatype").unwrap().as_ref(),
+            "image"
+        );
+    }
+
+    /// Newsletter revoke: plaintext `<message type="text" edit="8">` keyed by the
+    /// message id STRING, with an empty `<plaintext>`.
+    #[test]
+    fn build_newsletter_edit_node_revoke_is_empty_plaintext() {
+        let to: Jid = "120363000000000002@newsletter".parse().unwrap();
+        let node = build_newsletter_edit_node(&to, "3EB0REVOKETARGET", NewsletterEdit::Revoke);
+
+        let mut a = node.attrs();
+        assert_eq!(
+            a.optional_string("id").unwrap().as_ref(),
+            "3EB0REVOKETARGET"
+        );
+        assert_eq!(a.optional_string("type").unwrap().as_ref(), "text");
+        assert_eq!(a.optional_string("edit").unwrap().as_ref(), "8");
+
+        let pt = node
+            .get_optional_child("plaintext")
+            .expect("plaintext child");
+        let empty = match pt.content.as_ref() {
+            None => true,
+            Some(wacore_binary::NodeContent::Bytes(b)) => b.is_empty(),
+            _ => false,
+        };
+        assert!(empty, "revoke must carry an empty plaintext");
+    }
+
+    /// The public newsletter().edit_message wrapper emits the plaintext edit stanza
+    /// keyed by the message id it was given.
+    #[tokio::test]
+    async fn newsletter_edit_message_wrapper_sends_plaintext_edit() {
+        let client = crate::test_utils::create_test_client_with_name("nl_edit_wrap").await;
+        let channel: Jid = "120363000000000001@newsletter".parse().unwrap();
+        let waiter =
+            client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("edit", "3"));
+        let content = wa::Message {
+            conversation: Some("edited".to_string()),
+            ..Default::default()
+        };
+        // No socket on the test client: send_node captures the node, then errors.
+        let _ = client
+            .newsletter()
+            .edit_message(&channel, "TARGETMID", content)
+            .await;
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sent node captured")
+            .expect("waiter resolves");
+        let mut a = node.attrs();
+        assert_eq!(a.optional_string("id").unwrap().as_ref(), "TARGETMID");
+        assert_eq!(a.optional_string("edit").unwrap().as_ref(), "3");
+    }
+
+    /// The newsletter edit/revoke methods reject non-newsletter JIDs, so a misuse
+    /// cannot send plaintext content to a DM/group (it would not be E2E-encrypted).
+    #[tokio::test]
+    async fn newsletter_edit_revoke_reject_non_newsletter_jid() {
+        let client = crate::test_utils::create_test_client_with_name("nl_reject_nonchannel").await;
+        let dm: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
+        let group: Jid = "120363000000000009@g.us".parse().unwrap();
+
+        let e1 = client
+            .newsletter()
+            .edit_message(
+                &dm,
+                "MID",
+                wa::Message {
+                    conversation: Some("x".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("edit_message must reject a DM JID");
+        assert!(e1.to_string().to_lowercase().contains("newsletter"));
+
+        let e2 = client
+            .newsletter()
+            .revoke_message(&group, "MID")
+            .await
+            .expect_err("revoke_message must reject a group JID");
+        assert!(e2.to_string().to_lowercase().contains("newsletter"));
+    }
+
+    /// An empty message_id (NewsletterMessage.message_id may be empty if the server
+    /// omitted the id) is rejected rather than sending a target-less id="" stanza.
+    #[tokio::test]
+    async fn newsletter_edit_revoke_reject_empty_message_id() {
+        let client = crate::test_utils::create_test_client_with_name("nl_reject_empty_id").await;
+        let channel: Jid = "120363000000000001@newsletter".parse().unwrap();
+
+        let e1 = client
+            .newsletter()
+            .edit_message(
+                &channel,
+                "",
+                wa::Message {
+                    conversation: Some("x".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("edit_message must reject an empty message_id");
+        assert!(e1.to_string().to_lowercase().contains("message_id"));
+
+        let e2 = client
+            .newsletter()
+            .revoke_message(&channel, "")
+            .await
+            .expect_err("revoke_message must reject an empty message_id");
+        assert!(e2.to_string().to_lowercase().contains("message_id"));
     }
 
     #[tokio::test]
