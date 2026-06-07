@@ -68,7 +68,7 @@ pub enum PairError {
     #[error(transparent)]
     PairCode(#[from] PairCodeError),
 
-    #[error("pair-code IQ request failed")]
+    #[error("pair-code IQ request failed: {0}")]
     RequestFailed(#[from] IqError),
 }
 
