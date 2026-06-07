@@ -48,6 +48,10 @@ impl StanzaHandler for NotificationHandler {
 
 /// Dispatch notification by type. Each arm calls a separate async fn so the
 /// compiler doesn't size this future for all arms simultaneously.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.notif.dispatch", level = "debug", skip_all)
+)]
 async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
@@ -252,7 +256,11 @@ async fn handle_prekey_low(client: &Arc<Client>) {
                 return;
             }
 
-            if let Err(e) = client_clone.upload_pre_keys_with_retry(false).await {
+            // WA Web's handlePreKeyLow uploads unconditionally (no server-count query).
+            // Force past the count guard: the server only emits prekey-low after crossing
+            // its own (higher) threshold, so re-querying and skipping when count >= 5 lets
+            // the pool keep draining.
+            if let Err(e) = client_clone.upload_pre_keys_with_retry(true).await {
                 warn!(
                     "Failed to upload pre-keys after prekey_low notification: {:?}",
                     e
@@ -296,6 +304,10 @@ fn handle_digest_key(client: &Arc<Client>) {
 ///
 /// WA Web defers this when offline. We process immediately because all cleanup
 /// is local-only, and `ensure_e2e_sessions` self-defers via `wait_for_offline_delivery_end`.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.notif.identity_change", level = "debug", skip_all)
+)]
 async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
     let from_jid = crate::require_from_jid!(node, "Identity change notification");
 
@@ -303,7 +315,7 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
     if from_jid.device != 0 {
         debug!(
             "Ignoring identity change from companion device {}",
-            from_jid
+            from_jid.observe()
         );
         return;
     }
@@ -323,35 +335,107 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
         return;
     }
 
-    info!(
-        "Identity change for user {}: clearing device record",
-        from_jid.user
-    );
+    use wacore::libsignal::store::sender_key_name::SenderKeyName;
+    use wacore::types::jid::JidExt;
 
-    // Deletes non-primary sessions + all sender key device tracking
+    // Always run the device-list cleanup, matching WA Web's
+    // clearDeviceRecordForIdentityChange (which runs BEFORE the had-prior-identity
+    // gate): drop companion device sessions + force a fresh usync of the peer's
+    // device list on the next send.
     if let Some(record) = client.load_device_record(&from_jid.user).await {
         client
             .clear_device_record(&from_jid.user, from_jid.server.as_str(), &record)
             .await;
     }
+    client.invalidate_device_cache(&from_jid.user).await;
 
-    // Delete primary session + identity so a fresh session can be established,
-    // and rotate status sender key for forward secrecy (clear_device_record only
-    // cleared device tracking, not the key itself). Single flush covers both.
+    // WA Web gates the heavy reset behind loadIdentityKey(addr) != null
+    // (WAWebHandleIdentityChange: `if (!isStringNullOrEmpty(t))`). Read the stored
+    // identity non-destructively BEFORE deleting it. With no prior identity (e.g. a
+    // group-only peer we never had a session with), skip the session delete/rebuild,
+    // status sender-key rotation, tcToken reissue and the change notification — that
+    // path would otherwise eagerly fetch prekeys + X3DH to build a session we may
+    // never use.
+    //
+    // Check every address the identity could be stored under, because PN/LID
+    // resolution can diverge from where the state actually lives:
+    //   - the resolved (preferred LID-or-PN) address from resolve_encryption_jid;
+    //   - the original PN address (state can still be under PN when a PN->LID
+    //     mapping was learned from offline replay but the migration hasn't run yet);
+    //   - the LID carried by the stanza itself (the local cache may be cold/evicted
+    //     so resolve falls back to PN, yet the state lives under the stanza LID).
+    // Reading only the resolved address would false-negative and skip a real reset.
+    let resolved = client.resolve_encryption_jid(&from_jid).await;
+    let stanza_lid = node.attrs().optional_jid("lid");
+    let backend = client.persistence_manager.backend();
+
+    let mut reset_addrs = vec![resolved.to_protocol_address()];
+    for candidate in [Some(from_jid.clone()), stanza_lid.clone()]
+        .into_iter()
+        .flatten()
     {
-        use wacore::libsignal::store::sender_key_name::SenderKeyName;
-        use wacore::types::jid::JidExt;
+        let cand_addr = candidate.to_protocol_address();
+        if !reset_addrs.contains(&cand_addr) {
+            reset_addrs.push(cand_addr);
+        }
+    }
 
-        let resolved = client.resolve_encryption_jid(&from_jid).await;
-        let addr = resolved.to_protocol_address();
+    // Treat a backend read error as had-prior (fail-safe): run the reset rather
+    // than silently skip it, matching the old always-reset behavior. Collapsing
+    // an Err into "no prior identity" would be a fail-open regression on a
+    // session-deletion path (see the same explicit-match rule in lid_pn.rs).
+    let mut had_prior_identity = false;
+    for cand in &reset_addrs {
+        match client
+            .signal_cache
+            .get_identity(cand, backend.as_ref())
+            .await
+        {
+            Ok(Some(_)) => {
+                had_prior_identity = true;
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    "Identity change: failed reading stored identity for {}: {e}; proceeding with reset",
+                    wacore::types::jid::observe_protocol_address(cand)
+                );
+                had_prior_identity = true;
+                break;
+            }
+        }
+    }
 
-        // Hold session lock while deleting to prevent concurrent encrypt/decrypt
-        // from recreating the stale session (mirrors Signal::delete_sessions)
-        let lock = client.session_lock_for(addr.as_str()).await;
-        let _guard = lock.lock().await;
-        client.signal_cache.delete_session(&addr).await;
-        client.signal_cache.delete_identity(&addr).await;
-        drop(_guard);
+    if !had_prior_identity {
+        info!(
+            "Identity change for {} (had_prior_identity=false): device record cleared, skipping session reset",
+            from_jid.user
+        );
+        return;
+    }
+
+    // Counted here, past the companion/self/no-prior gates, so it reflects actual
+    // session resets rather than every identity-change push received.
+    wacore::telemetry::identity_change();
+    info!(
+        "Identity change for {} (had_prior_identity=true): resetting session",
+        from_jid.user
+    );
+
+    // Delete the session + identity at every candidate address (resolved + the
+    // pre-migration PN one) so a fresh session can be established, and rotate the
+    // status sender key for forward secrecy. Single flush covers all of it.
+    {
+        for cand in &reset_addrs {
+            // Hold the per-address session lock while deleting to prevent concurrent
+            // encrypt/decrypt from recreating the stale session (mirrors
+            // Signal::delete_sessions). One lock at a time, so no lock-ordering risk.
+            let lock = client.session_lock_for(cand.as_str()).await;
+            let _guard = lock.lock().await;
+            client.signal_cache.delete_session(cand).await;
+            client.signal_cache.delete_identity(cand).await;
+        }
 
         let status_group = "status@broadcast";
         for own_jid in device_snapshot.pn.iter().chain(device_snapshot.lid.iter()) {
@@ -368,27 +452,127 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
             .await;
     }
 
-    // Force fresh usync on next send
-    client.invalidate_device_cache(&from_jid.user).await;
+    // Re-issue an active trusted-contact token, matching WA Web
+    // handleE2eIdentityChange -> sendTcTokenWhenDeviceIdentityChange. Spawned so
+    // the notification handler doesn't block on an IQ; it no-ops unless a
+    // non-expired sender token already exists.
+    if !from_jid.is_bot() && !from_jid.is_status_broadcast() {
+        let tc_client = client.clone();
+        let tc_jid = from_jid.clone();
+        client
+            .runtime
+            .spawn(Box::pin(async move {
+                tc_client
+                    .reissue_tc_token_after_identity_change(&tc_jid)
+                    .await;
+            }))
+            .detach();
+    }
 
-    let session_jid = from_jid.clone();
+    // = addSecurityCodeChangedNotifications, which WA Web fires inside the gate.
     client.core.event_bus.dispatch(Event::IdentityChange(
         crate::types::events::IdentityChange {
-            user: from_jid,
-            lid_user: node.attrs().optional_jid("lid"),
+            user: from_jid.clone(),
+            lid_user: stanza_lid,
+            implicit: false,
         },
     ));
 
-    // Re-establish session in background (self-defers when offline)
-    let client_clone = client.clone();
-    client
-        .runtime
-        .spawn(Box::pin(async move {
-            if let Err(e) = client_clone.ensure_e2e_sessions(&[session_jid]).await {
-                warn!("Identity change: failed to re-establish session: {e}");
-            }
-        }))
-        .detach();
+    // Re-establish the session eagerly so the next send is fast (WA Web does this
+    // inside the gate too). Skip only while the offline backlog is still draining,
+    // matching WA Web's `C = !isEmpty(offline) && !isResumeFromRestartComplete()`:
+    // deferring every offline-tagged push would otherwise pile up a prekey-fetch
+    // burst when the resume completes. Deferral is safe because every send path
+    // re-establishes before encrypting (ensure_e2e_sessions in the DM/group send
+    // paths, plus encrypt_for_devices' own has_session->prekey-fetch fallback).
+    let arrived_during_resume = node.attrs().optional_string("offline").is_some()
+        && !client
+            .offline_sync_completed
+            .load(std::sync::atomic::Ordering::Relaxed);
+    if arrived_during_resume {
+        debug!(
+            "Identity change for {} arrived during offline resume; deferring session re-establishment to next send",
+            from_jid.user
+        );
+    } else {
+        let client_clone = client.clone();
+        let session_jid = from_jid;
+        client
+            .runtime
+            .spawn(Box::pin(async move {
+                if let Err(e) = client_clone.ensure_e2e_sessions(&[session_jid]).await {
+                    warn!("Identity change: failed to re-establish session: {e}");
+                }
+            }))
+            .detach();
+    }
+}
+
+/// React to a locally-detected identity change.
+///
+/// Fires when decrypting a peer's message saved a new identity key that replaced
+/// a different one (`IdentityChange::ReplacedExisting`). Mirrors WA Web
+/// `ProtocolStoreUnifiedApi.saveIdentity` -> `handleNewIdentity`: clear the
+/// device-list/sender-key tracking, force a fresh usync, re-issue an active tc
+/// token, and emit `Event::IdentityChange { implicit: true }`.
+///
+/// Deliberately lighter than the server `<identity/>` push handler
+/// ([`handle_identity_change`]): it does NOT delete the primary session, rotate
+/// the status sender key, or re-establish sessions. The message that triggered
+/// this is establishing the new session right now, and the heavier reset is the
+/// server push's job (which reliably follows). This matches WA Web, where the
+/// local `handleNewIdentity` omits those steps that only the server-push
+/// `handleE2eIdentityChange` performs.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.notif.local_identity_change", level = "debug", skip_all, fields(sender = %sender.observe())))]
+pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: Jid) {
+    // Only a peer's primary-device identity change matters; companion devices
+    // carry their own identities (WA Web ignores them on this path).
+    if sender.device != 0 {
+        return;
+    }
+
+    // Self-identity changes use a separate flow; clearing our own record would
+    // break our sessions.
+    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let is_me = device_snapshot
+        .pn
+        .as_ref()
+        .is_some_and(|pn| pn.user == sender.user)
+        || device_snapshot
+            .lid
+            .as_ref()
+            .is_some_and(|lid| lid.user == sender.user);
+    if is_me {
+        return;
+    }
+
+    info!(
+        "Local identity change detected for {}: clearing device record",
+        sender.user
+    );
+
+    // Deletes non-primary sessions + all sender key device tracking.
+    if let Some(record) = client.load_device_record(&sender.user).await {
+        client
+            .clear_device_record(&sender.user, sender.server.as_str(), &record)
+            .await;
+    }
+
+    // Force a fresh usync on next send so we re-learn the peer's device list.
+    client.invalidate_device_cache(&sender.user).await;
+
+    // Re-issue an active trusted-contact token (no-op unless one is live).
+    if !sender.is_bot() && !sender.is_status_broadcast() {
+        client.reissue_tc_token_after_identity_change(&sender).await;
+    }
+
+    client.core.event_bus.dispatch(Event::IdentityChange(
+        crate::types::events::IdentityChange {
+            user: sender,
+            lid_user: None,
+            implicit: true,
+        },
+    ));
 }
 
 /// Handle device list change notifications.
@@ -403,6 +587,10 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
 ///   </add/remove/update>
 /// </notification>
 /// ```
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.notif.devices", level = "debug", skip_all)
+)]
 async fn handle_devices_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
     let notification = match DeviceNotification::try_parse(node) {
         Ok(n) => n,
@@ -550,7 +738,7 @@ async fn handle_account_sync_devices(
         warn!(
             target: "Client/AccountSync",
             "Received account_sync devices for non-self user: {} (our PN: {:?}, LID: {:?})",
-            from_jid,
+            from_jid.observe(),
             own_pn.map(|j| j.user.as_str()),
             own_lid.map(|j| j.user.as_str())
         );
@@ -620,7 +808,7 @@ async fn handle_account_sync_devices(
         debug!(
             target: "Client/AccountSync",
             "  Device: {} (key-index: {:?})",
-            device.jid,
+            device.jid.observe(),
             device.key_index
         );
     }
@@ -639,6 +827,10 @@ async fn handle_account_sync_devices(
 ///   </tokens>
 /// </notification>
 /// ```
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.notif.privacy_token", level = "debug", skip_all)
+)]
 async fn handle_privacy_token_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
     use wacore::iq::tctoken::parse_privacy_token_notification;
     use wacore::store::traits::TcTokenEntry;
@@ -676,7 +868,7 @@ async fn handle_privacy_token_notification(client: &Arc<Client>, node: &NodeRef<
                     debug!(
                         target: "Client/TcToken",
                         "Cannot resolve LID for privacy_token sender {}, storing under PN",
-                        from
+                        from.observe()
                     );
                     &from.user
                 }
@@ -769,7 +961,7 @@ async fn handle_privacy_token_notification(client: &Arc<Client>, node: &NodeRef<
         && let Some(from) = &from_jid
         && let Err(e) = client.presence().re_subscribe_when_active(from).await
     {
-        debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {from}: {e}");
+        debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {}: {e}", from.observe());
     }
 }
 
@@ -786,7 +978,7 @@ async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
     debug!(
         target: "Client/Business",
         "Business notification: from={}, type={}, jid={:?}",
-        notification.from,
+        notification.from.observe(),
         notification.notification_type,
         notification.jid
     );
@@ -815,7 +1007,7 @@ async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
             info!(
                 target: "Client/Business",
                 "Contact {} is no longer a business account",
-                notification.from
+                notification.from.observe()
             );
         }
         wacore::stanza::business::BusinessNotificationType::VerifiedNameJid
@@ -828,7 +1020,7 @@ async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
                 info!(
                     target: "Client/Business",
                     "Contact {} verified business name: {}",
-                    notification.from,
+                    notification.from.observe(),
                     name
                 );
             }
@@ -838,7 +1030,7 @@ async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
             debug!(
                 target: "Client/Business",
                 "Contact {} business profile updated (hash: {:?})",
-                notification.from,
+                notification.from.observe(),
                 notification.hash
             );
         }
@@ -884,7 +1076,7 @@ fn handle_picture_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
             if set_node.attrs().optional_string("hash").is_some() {
                 debug!(
                     target: "Client/Picture",
-                    "Hash-based picture notification (no jid), using from={}", from
+                    "Hash-based picture notification (no jid), using from={}", from.observe()
                 );
             }
             from.clone()
@@ -920,7 +1112,7 @@ fn handle_picture_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
                 .and_then(|c| c.first().map(|n| n.tag.as_ref()));
             debug!(
                 target: "Client/Picture",
-                "Ignoring picture notification with child {:?} from {}", child_tag, from
+                "Ignoring picture notification with child {:?} from {}", child_tag, from.observe()
             );
             return;
         }
@@ -930,7 +1122,7 @@ fn handle_picture_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
         target: "Client/Picture",
         "Picture {}: jid={}, author={:?}, pic_id={:?}",
         if removed { "removed" } else { "updated" },
-        jid, author, picture_id
+        jid.observe(), author, picture_id
     );
 
     let event = Event::PictureUpdate(PictureUpdate {
@@ -971,7 +1163,7 @@ fn handle_status_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
 
         debug!(
             target: "Client/Status",
-            "Status update from {} (length={})", from, status_text.len()
+            "Status update from {} (length={})", from.observe(), status_text.len()
         );
 
         let event = Event::UserAboutUpdate(UserAboutUpdate {
@@ -983,7 +1175,7 @@ fn handle_status_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
     } else {
         debug!(
             target: "Client/Status",
-            "Status notification from {} without <set> child, ignoring", from
+            "Status notification from {} without <set> child, ignoring", from.observe()
         );
     }
 }
@@ -1022,7 +1214,7 @@ async fn learn_contact_modify_mappings(
                 warn!(
                     target: "Client/Contacts",
                     "Failed to add LID-PN mapping lid={} pn={}: {e}",
-                    lid, pn
+                    lid.observe(), pn.observe()
                 );
             }
         }
@@ -1030,7 +1222,7 @@ async fn learn_contact_modify_mappings(
         debug!(
             target: "Client/Contacts",
             "Contacts modify without old_lid/new_lid, skipping LID-PN mapping (old={}, new={})",
-            old_pn, new_pn
+            old_pn.observe(), new_pn.observe()
         );
     }
 }
@@ -1069,7 +1261,7 @@ async fn handle_contacts_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
                 return;
             };
 
-            debug!(target: "Client/Contacts", "Contact updated for {}", jid);
+            debug!(target: "Client/Contacts", "Contact updated for {}", jid.observe());
             client
                 .core
                 .event_bus
@@ -1101,7 +1293,7 @@ async fn handle_contacts_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
             debug!(
                 target: "Client/Contacts",
                 "Contact number changed: {} -> {} (old_lid={:?}, new_lid={:?})",
-                old_jid, new_jid, old_lid, new_lid
+                old_jid.observe(), new_jid.observe(), old_lid, new_lid
             );
             client
                 .core
@@ -1156,6 +1348,10 @@ async fn handle_contacts_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
 /// and dispatches typed `Event::GroupUpdate` events for each.
 ///
 /// Reference: WhatsApp Web `WAWebHandleGroupNotification` (Ri7Gf1BxhsX.js:12556-12962)
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.notif.group", level = "debug", skip_all)
+)]
 async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     let notification = match GroupNotification::try_from_node_ref(node.get()) {
         Some(n) => n,
@@ -1177,34 +1373,36 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
         match &action {
             GroupNotificationAction::Add { participants, .. } => {
                 let group_cache = client.get_group_cache().await;
-                if let Some(mut info) = group_cache.get(&notification.group_jid).await {
+                if let Some(info) = group_cache.get(&notification.group_jid).await {
+                    let mut info = Arc::unwrap_or_clone(info);
                     info.add_participants(
                         participants
                             .iter()
                             .map(|p| (&p.jid, p.phone_number.as_ref())),
                     );
                     group_cache
-                        .insert(notification.group_jid.clone(), info)
+                        .insert(notification.group_jid.clone(), Arc::new(info))
                         .await;
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: added {} participants",
-                        notification.group_jid, participants.len()
+                        notification.group_jid.observe(), participants.len()
                     );
                 }
             }
             GroupNotificationAction::Remove { participants, .. } => {
                 let users: Vec<&str> = participants.iter().map(|p| p.jid.user.as_str()).collect();
                 let group_cache = client.get_group_cache().await;
-                if let Some(mut info) = group_cache.get(&notification.group_jid).await {
+                if let Some(info) = group_cache.get(&notification.group_jid).await {
+                    let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
                     group_cache
-                        .insert(notification.group_jid.clone(), info)
+                        .insert(notification.group_jid.clone(), Arc::new(info))
                         .await;
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: removed {} participants",
-                        notification.group_jid, participants.len()
+                        notification.group_jid.observe(), participants.len()
                     );
                 }
                 client
@@ -1220,7 +1418,7 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
         debug!(
             target: "Client/Group",
             "Group notification: group={}, action={}",
-            notification.group_jid, action.tag_name()
+            notification.group_jid.observe(), action.tag_name()
         );
 
         client
@@ -1422,7 +1620,9 @@ fn handle_disappearing_mode_notification(client: &Arc<Client>, node: &NodeRef<'_
 
     debug!(
         "Disappearing mode changed for {}: duration={}s, t={}",
-        from, duration, setting_timestamp
+        from.observe(),
+        duration,
+        setting_timestamp
     );
 
     client
@@ -2159,8 +2359,19 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("5511999999999".into(), record)
+            .insert("5511999999999".into(), Arc::new(record))
             .await;
+
+        // Seed a stored identity so the had-prior-identity gate runs the full reset
+        // (delete + notify), matching WA Web's `if (!isEmpty(loadIdentityKey(addr)))`.
+        {
+            use wacore::types::jid::JidExt;
+            let target: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
+            client
+                .signal_cache
+                .put_identity(&target.to_protocol_address(), &[7u8; 32])
+                .await;
+        }
 
         // Simulate identity change notification: type="encrypt" with <identity/> child
         let node = NodeBuilder::new("notification")
@@ -2242,6 +2453,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_local_identity_change_dispatches_implicit_event() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let sender: Jid = "5511777777777@s.whatsapp.net".parse().unwrap();
+        handle_local_identity_change(&client, sender).await;
+
+        let events = collector.events();
+        // The event is dispatched last (after clear_device_record +
+        // invalidate_device_cache), so observing it proves the handler ran to
+        // completion. invalidate_device_cache itself is covered by
+        // test_invalidate_device_cache_uses_correct_jid_types.
+        let ic = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::IdentityChange(ic) => Some(ic.clone()),
+                _ => None,
+            })
+            .expect("local detection should dispatch IdentityChange");
+        assert!(
+            ic.implicit,
+            "locally-detected identity change must set implicit=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_identity_change_skips_self() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        client
+            .persistence_manager
+            .modify_device(|d| {
+                d.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
+            })
+            .await;
+
+        let sender: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
+        handle_local_identity_change(&client, sender).await;
+
+        assert!(
+            collector.events().is_empty(),
+            "self identity change must never clear our own record"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_identity_change_skips_companion_device() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let sender: Jid = "5511777777777:5@s.whatsapp.net".parse().unwrap();
+        handle_local_identity_change(&client, sender).await;
+
+        assert!(
+            collector.events().is_empty(),
+            "companion device identity change should be ignored"
+        );
+    }
+
+    #[tokio::test]
     async fn test_identity_change_deletes_primary_session() {
         use wacore::libsignal::protocol::SessionRecord;
         use wacore::types::jid::JidExt;
@@ -2307,6 +2582,14 @@ mod tests {
             .put_sender_key(&sk_name, sk_record)
             .await;
 
+        // Seed a stored identity for the changed user so the had-prior-identity gate
+        // runs the reset (which rotates the status sender key).
+        let changed: Jid = "5511888888888@s.whatsapp.net".parse().unwrap();
+        client
+            .signal_cache
+            .put_identity(&changed.to_protocol_address(), &[7u8; 32])
+            .await;
+
         // Fire identity change for a different user
         let node = NodeBuilder::new("notification")
             .attr("type", "encrypt")
@@ -2330,9 +2613,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_identity_change_with_offline_attribute() {
+        use wacore::types::jid::JidExt;
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
         client.register_handler(collector.clone());
+
+        // Prior identity present so the gate runs (the offline attr only defers the
+        // eager session re-establishment, not the change notification).
+        let changed: Jid = "5511888888888@s.whatsapp.net".parse().unwrap();
+        client
+            .signal_cache
+            .put_identity(&changed.to_protocol_address(), &[7u8; 32])
+            .await;
 
         // Notification with offline attribute should still be processed
         let node = NodeBuilder::new("notification")
@@ -2350,6 +2642,210 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&**e, Event::IdentityChange(_))),
             "offline identity change should still dispatch event"
+        );
+    }
+
+    /// With no prior identity for the peer (e.g. a group-only member we never had a
+    /// session with), the had-prior-identity gate skips the heavy reset: no change
+    /// notification and no session/identity deletion. Only the device-list cleanup
+    /// runs. Mirrors WA Web `if (!isEmpty(loadIdentityKey(addr)))`.
+    #[tokio::test]
+    async fn test_identity_change_no_prior_identity_skips_reset() {
+        use wacore::types::jid::JidExt;
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let target: Jid = "5511666666666@s.whatsapp.net".parse().unwrap();
+        let addr = target.to_protocol_address();
+        // Seed a device-registry entry (with a companion device) so the always-on
+        // cleanup has something to do, but deliberately do NOT seed an identity.
+        client
+            .device_registry_cache
+            .insert(
+                "5511666666666".into(),
+                Arc::new(wacore::store::traits::DeviceListRecord {
+                    user: "5511666666666".into(),
+                    devices: vec![wacore::store::traits::DeviceInfo {
+                        device_id: 1,
+                        key_index: None,
+                    }],
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: Some(1),
+                }),
+            )
+            .await;
+
+        // Seed a companion-device (device 1) Signal session: clear_device_record
+        // runs even on the no-prior path, so this must be deleted afterward. Keyed
+        // the same way delete_sessions_for_devices builds the address.
+        let mut companion = wacore_binary::Jid::new("5511666666666", wacore_binary::Server::Pn);
+        companion.device = 1;
+        let companion_addr = companion.to_protocol_address();
+        client
+            .signal_cache
+            .put_session(
+                &companion_addr,
+                wacore::libsignal::protocol::SessionRecord::new_fresh(),
+            )
+            .await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "encrypt")
+            .attr("from", "5511666666666@s.whatsapp.net")
+            .attr("id", "identity-change-noprior")
+            .children([NodeBuilder::new("identity").build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        // No change notification for a peer we had no prior identity with.
+        assert!(
+            collector.events().is_empty(),
+            "no-prior-identity push must not dispatch IdentityChange, got: {:?}",
+            collector.events()
+        );
+        // But the always-on device-list cleanup still ran.
+        assert!(
+            client
+                .device_registry_cache
+                .get("5511666666666")
+                .await
+                .is_none(),
+            "device registry cache should still be invalidated on the no-prior path"
+        );
+        // And no identity was created by an (skipped) eager re-establishment.
+        let backend = client.persistence_manager.backend();
+        assert!(
+            client
+                .signal_cache
+                .get_identity(&addr, backend.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "no-prior path must not establish an identity"
+        );
+        // The always-on clear_device_record must still delete companion sessions.
+        assert!(
+            !client
+                .signal_cache
+                .has_session(&companion_addr, backend.as_ref())
+                .await
+                .unwrap(),
+            "companion-device session must be cleared even on the no-prior path"
+        );
+    }
+
+    /// Regression: when a PN->LID mapping was learned offline (migration deferred),
+    /// the identity is still under the PN address while resolve_encryption_jid points
+    /// at the LID. The gate must check the original PN address too and still run the
+    /// reset (delete the stale PN identity + dispatch the event), not false-negative.
+    #[tokio::test]
+    async fn test_identity_change_resets_unmigrated_pn_identity_under_lid_resolve() {
+        use wacore::types::jid::JidExt;
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let pn = "5511555555555";
+        let lid = "100000000000055";
+        // Offline learn: records the PN->LID mapping in cache but skips the Signal
+        // migration, so resolve points at the LID while state stays under the PN.
+        client
+            .learn_lid_pn_mapping_fast(lid, pn, LearningSource::Other, true)
+            .await;
+
+        let pn_jid: Jid = "5511555555555@s.whatsapp.net".parse().unwrap();
+        // Confirm the setup actually diverges (resolve -> LID), else the test is moot.
+        let resolved = client.resolve_encryption_jid(&pn_jid).await;
+        assert!(
+            resolved.is_lid(),
+            "test setup: resolve_encryption_jid should return the LID, got {resolved}"
+        );
+
+        // Seed the identity under the PN address (not the LID).
+        let pn_addr = pn_jid.to_protocol_address();
+        client.signal_cache.put_identity(&pn_addr, &[7u8; 32]).await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "encrypt")
+            .attr("from", "5511555555555@s.whatsapp.net")
+            .attr("id", "identity-change-pnlid")
+            .children([NodeBuilder::new("identity").build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        assert!(
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::IdentityChange(_))),
+            "must dispatch IdentityChange when the identity is under the unmigrated PN address"
+        );
+        let backend = client.persistence_manager.backend();
+        assert!(
+            client
+                .signal_cache
+                .get_identity(&pn_addr, backend.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "the stale PN identity must be deleted by the reset"
+        );
+    }
+
+    /// Regression: a stanza can carry a `lid` attr while the local PN->LID cache is
+    /// cold, so resolve_encryption_jid falls back to PN. If the identity lives under
+    /// the stanza LID, the gate must still find it (via the stanza-LID candidate) and
+    /// run the reset rather than skip it.
+    #[tokio::test]
+    async fn test_identity_change_resets_identity_under_stanza_lid_with_cold_cache() {
+        use wacore::types::jid::JidExt;
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        // Cold cache: no PN->LID mapping, so resolve_encryption_jid(PN) returns PN.
+        let pn_jid: Jid = "5511444444444@s.whatsapp.net".parse().unwrap();
+        let resolved = client.resolve_encryption_jid(&pn_jid).await;
+        assert!(
+            !resolved.is_lid(),
+            "test setup: cache must be cold (resolve -> PN), got {resolved}"
+        );
+
+        // The identity lives under the LID carried by the stanza, not the PN.
+        let lid_jid: Jid = "100000000000066@lid".parse().unwrap();
+        let lid_addr = lid_jid.to_protocol_address();
+        client
+            .signal_cache
+            .put_identity(&lid_addr, &[7u8; 32])
+            .await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "encrypt")
+            .attr("from", "5511444444444@s.whatsapp.net")
+            .attr("lid", "100000000000066@lid")
+            .attr("id", "identity-change-stanzalid")
+            .children([NodeBuilder::new("identity").build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        assert!(
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::IdentityChange(_))),
+            "must dispatch IdentityChange when the identity is under the stanza LID"
+        );
+        let backend = client.persistence_manager.backend();
+        assert!(
+            client
+                .signal_cache
+                .get_identity(&lid_addr, backend.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "the stale stanza-LID identity must be deleted by the reset"
         );
     }
 }

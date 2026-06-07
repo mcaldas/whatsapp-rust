@@ -58,6 +58,7 @@ impl MessageContext {
         Some(Self::from_arc(Arc::clone(msg), info, client))
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.send_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     pub async fn send_message(
         &self,
         message: wa::Message,
@@ -68,10 +69,14 @@ impl MessageContext {
     }
 
     pub fn build_quote_context(&self) -> wa::ContextInfo {
+        // A bot reply is same-chat: quoted chat and send target are both
+        // info.source.chat, so remote_jid is omitted (WA Web parity).
+        let chat = &self.info.source.chat;
         wacore::proto_helpers::build_quote_context_with_info(
             &self.info.id,
             &self.info.source.sender,
-            &self.info.source.chat,
+            chat,
+            chat,
             &self.message,
         )
     }
@@ -90,6 +95,7 @@ impl MessageContext {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.edit_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     pub async fn edit_message(
         &self,
         original_message_id: impl Into<String>,
@@ -105,6 +111,7 @@ impl MessageContext {
     }
 
     /// Delete a message for everyone in the chat.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.revoke_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     pub async fn revoke_message(
         &self,
         message_id: String,
@@ -112,6 +119,16 @@ impl MessageContext {
     ) -> Result<(), anyhow::Error> {
         self.client
             .revoke_message(self.info.source.chat.clone(), message_id, revoke_type)
+            .await
+    }
+
+    /// React to the incoming message. An empty `emoji` removes a previous
+    /// reaction. The target key (including the group/status participant) is
+    /// taken from [`MessageContext::message_key`].
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.react", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
+    pub async fn react(&self, emoji: &str) -> Result<crate::send::SendResult, anyhow::Error> {
+        self.client
+            .send_reaction(&self.info.source.chat, self.message_key(), emoji)
             .await
     }
 }
@@ -207,6 +224,10 @@ impl Bot {
         self.client.clone()
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.bot.run", level = "debug", skip_all, err(Debug))
+    )]
     pub async fn run(&mut self) -> Result<BotHandle> {
         if let Some(receiver) = self.sync_task_receiver.take() {
             let worker_client = Arc::downgrade(&self.client);
@@ -297,6 +318,7 @@ pub struct BotBuilder<B = Missing, T = Missing, H = Missing, R = Missing> {
     skip_history_sync: bool,
     initial_push_name: Option<String>,
     cache_config: CacheConfig,
+    wanted_pre_key_count: Option<usize>,
     _marker: PhantomData<(B, T, H, R)>,
 }
 
@@ -315,6 +337,7 @@ impl BotBuilder<Missing, Missing, Missing, Missing> {
             skip_history_sync: false,
             initial_push_name: None,
             cache_config: CacheConfig::default(),
+            wanted_pre_key_count: None,
             _marker: PhantomData,
         }
     }
@@ -351,6 +374,7 @@ impl<T, H, R> BotBuilder<Missing, T, H, R> {
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
+            wanted_pre_key_count: self.wanted_pre_key_count,
             _marker: PhantomData,
         }
     }
@@ -390,6 +414,7 @@ impl<B, H, R> BotBuilder<B, Missing, H, R> {
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
+            wanted_pre_key_count: self.wanted_pre_key_count,
             _marker: PhantomData,
         }
     }
@@ -428,6 +453,7 @@ impl<B, T, R> BotBuilder<B, T, Missing, R> {
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
+            wanted_pre_key_count: self.wanted_pre_key_count,
             _marker: PhantomData,
         }
     }
@@ -451,6 +477,7 @@ impl<B, T, H> BotBuilder<B, T, H, Missing> {
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
+            wanted_pre_key_count: self.wanted_pre_key_count,
             _marker: PhantomData,
         }
     }
@@ -620,6 +647,27 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Set how many one-time pre-keys are generated and uploaded per batch.
+    ///
+    /// Defaults to WA Web's UPLOAD_KEYS_COUNT (812). The value is clamped to the
+    /// protocol-safe range at upload time. Useful for memory-constrained or
+    /// embedded consumers that want a smaller batch.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let bot = Bot::builder()
+    ///     .with_backend(backend)
+    ///     .with_transport_factory(transport)
+    ///     .with_http_client(http_client)
+    ///     .with_wanted_pre_key_count(200)
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn with_wanted_pre_key_count(mut self, count: usize) -> Self {
+        self.wanted_pre_key_count = Some(count);
+        self
+    }
+
     /// Set an initial push name on the device before connecting.
     ///
     /// This is included in the `ClientPayload` during registration, allowing the
@@ -661,6 +709,10 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
 // ── build() — only available when all 4 required fields are Provided ─────
 
 impl BotBuilder<Provided, Provided, Provided, Provided> {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.bot.build", level = "debug", skip_all, err(Debug))
+    )]
     pub async fn build(self) -> std::result::Result<Bot, BotBuilderError> {
         // Destructure to extract required fields — typestate guarantees all are Some.
         let (Some(runtime), Some(backend), Some(transport_factory), Some(http_client)) = (
@@ -728,6 +780,10 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
 
         if self.skip_history_sync {
             client.set_skip_history_sync(true);
+        }
+
+        if let Some(count) = self.wanted_pre_key_count {
+            client.set_wanted_pre_key_count(count);
         }
 
         Ok(Bot {
@@ -1116,6 +1172,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bot_builder_wanted_pre_key_count() {
+        let backend = create_test_sqlite_backend().await;
+        let transport = TokioWebSocketTransportFactory::new();
+        let http_client = MockHttpClient;
+
+        let bot = Bot::builder()
+            .with_backend(backend)
+            .with_transport_factory(transport)
+            .with_http_client(http_client)
+            .with_wanted_pre_key_count(200)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot with custom pre-key count");
+
+        assert_eq!(bot.client().wanted_pre_key_count(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_bot_builder_default_wanted_pre_key_count() {
+        let backend = create_test_sqlite_backend().await;
+        let transport = TokioWebSocketTransportFactory::new();
+        let http_client = MockHttpClient;
+
+        let bot = Bot::builder()
+            .with_backend(backend)
+            .with_transport_factory(transport)
+            .with_http_client(http_client)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        assert_eq!(
+            bot.client().wanted_pre_key_count(),
+            crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT
+        );
+    }
+
+    #[tokio::test]
     async fn from_arc_does_not_deep_clone() {
         let backend = create_test_sqlite_backend().await;
         let bot = Bot::builder()
@@ -1137,5 +1233,92 @@ mod tests {
             MessageContext::from_arc(Arc::clone(&original), &MessageInfo::default(), bot.client());
 
         assert!(std::ptr::eq(Arc::as_ptr(&ctx.message), original_ptr));
+    }
+
+    async fn test_context_with_info(info: MessageInfo) -> MessageContext {
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+        MessageContext::from_arc(Arc::new(wa::Message::default()), &info, bot.client())
+    }
+
+    fn react_info(chat: &str, sender: &str, id: &str, is_group: bool) -> MessageInfo {
+        use crate::types::message::MessageSource;
+        MessageInfo {
+            id: id.to_string(),
+            source: MessageSource {
+                chat: chat.parse().expect("chat jid"),
+                sender: sender.parse().expect("sender jid"),
+                is_group,
+                is_from_me: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn react_target_key_carries_group_participant() {
+        let info = react_info(
+            "120363012345@g.us",
+            "15551230000@s.whatsapp.net",
+            "MSGID01",
+            true,
+        );
+        let ctx = test_context_with_info(info).await;
+        let key = ctx.message_key();
+
+        assert_eq!(key.remote_jid.as_deref(), Some("120363012345@g.us"));
+        assert_eq!(key.id.as_deref(), Some("MSGID01"));
+        assert_eq!(key.from_me, Some(false));
+        // Group reactions must attribute the original sender via participant.
+        assert_eq!(
+            key.participant.as_deref(),
+            Some("15551230000@s.whatsapp.net")
+        );
+    }
+
+    #[tokio::test]
+    async fn react_target_key_omits_participant_in_dm() {
+        let info = react_info(
+            "15559990000@s.whatsapp.net",
+            "15559990000@s.whatsapp.net",
+            "MSGID02",
+            false,
+        );
+        let ctx = test_context_with_info(info).await;
+        let key = ctx.message_key();
+
+        assert_eq!(
+            key.remote_jid.as_deref(),
+            Some("15559990000@s.whatsapp.net")
+        );
+        // DMs do not carry participant (matches WA Web message-key shape).
+        assert!(key.participant.is_none());
+    }
+
+    #[tokio::test]
+    async fn react_target_key_carries_status_author() {
+        let info = react_info(
+            "status@broadcast",
+            "15551112222@s.whatsapp.net",
+            "MSGID03",
+            false,
+        );
+        let ctx = test_context_with_info(info).await;
+        let key = ctx.message_key();
+
+        // status@broadcast reactions fan out to the author's devices, so the
+        // author must be present in participant for the send path to extract it.
+        assert_eq!(
+            key.participant.as_deref(),
+            Some("15551112222@s.whatsapp.net")
+        );
     }
 }

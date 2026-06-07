@@ -90,6 +90,9 @@ impl<'a> Profile<'a> {
     /// Sends a JPEG image as the new profile picture. The image should already
     /// be properly sized/cropped by the caller (WhatsApp typically uses 640x640).
     ///
+    /// Passing empty `image_data` **removes** the picture (matching WhatsApp Web);
+    /// call [`Profile::remove_profile_picture`] when removal is the intent.
+    ///
     /// ## Wire Format
     /// ```xml
     /// <iq type="set" xmlns="w:profile:picture" to="s.whatsapp.net">
@@ -100,10 +103,11 @@ impl<'a> Profile<'a> {
         &self,
         image_data: Vec<u8>,
     ) -> Result<SetProfilePictureResponse> {
+        // for_own routes empty bytes to the remove path, matching WA Web; no panic.
         debug!("Setting profile picture (size={} bytes)", image_data.len());
         Ok(self
             .client
-            .execute(SetProfilePictureSpec::set_own(image_data))
+            .execute(SetProfilePictureSpec::for_own(image_data))
             .await?)
     }
 
@@ -118,11 +122,8 @@ impl<'a> Profile<'a> {
 
     /// Build and send the `setting_pushName` app state mutation.
     async fn send_push_name_mutation(&self, name: &str) -> Result<()> {
-        use rand::Rng;
-        use wacore::appstate::encode::encode_record;
+        use wacore::appstate::schemas;
         use waproto::whatsapp as wa;
-
-        let index = serde_json::to_vec(&["setting_pushName"])?;
 
         let value = wa::SyncActionValue {
             push_name_setting: Some(wa::sync_action_value::PushNameSetting {
@@ -131,35 +132,9 @@ impl<'a> Profile<'a> {
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-
-        // Get the latest sync key for encryption
-        let proc = self.client.get_app_state_processor().await;
-        let key_id = proc
-            .backend
-            .get_latest_sync_key_id()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?
-            .ok_or_else(|| anyhow::anyhow!("No app state sync key available"))?;
-        let keys = proc.get_app_state_key(&key_id).await?;
-
-        // Generate random IV
-        let mut iv = [0u8; 16];
-        rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
-
-        let (mutation, _) = encode_record(
-            wa::syncd_mutation::SyncdOperation::Set,
-            &index,
-            &value,
-            &keys,
-            &key_id,
-            &iv,
-        );
-
+        // setting_pushName's index has no args (collection/version come from the schema).
         self.client
-            .send_app_state_patch(
-                wacore::appstate::patch_decode::WAPatchName::CriticalBlock.as_str(),
-                vec![mutation],
-            )
+            .send_app_state_action(&schemas::SETTING_PUSH_NAME, &[], &value)
             .await
     }
 }

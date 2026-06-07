@@ -132,6 +132,10 @@ impl Client {
             || info.source.is_self_fanout()
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.receipt.handle", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_receipt(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
         let nr = node.get();
         let mut attrs = nr.attrs();
@@ -146,6 +150,8 @@ impl Client {
         let receipt_type_cow = attrs.optional_string("type");
         let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
         let participant = attrs.optional_jid("participant");
+        // participant_pn -> sender_alt so the LID-PN cache warms from receipts too.
+        let participant_pn = attrs.optional_jid("participant_pn");
         let stanza_ts = attrs
             .optional_u64("t")
             .and_then(|t| i64::try_from(t).ok())
@@ -153,6 +159,10 @@ impl Client {
             .unwrap_or_else(wacore::time::now_utc);
 
         let receipt_type = ReceiptType::parse(receipt_type_str);
+        // WA Web downgrades a delivery ack to "sent" (not delivered) when the receipt carries
+        // <error reason="lid" type="feature-incapable"> (the LID peer can't receive it).
+        let receipt_type =
+            wacore::stanza::receipt::downgrade_for_feature_incapable(nr, receipt_type);
         let is_view = receipt_type_str == "view";
         let is_group = from.is_group();
         let default_sender = if is_group {
@@ -174,8 +184,9 @@ impl Client {
                 .or_else(|| agg_key.clone())
                 .unwrap_or_else(|| stanza_id.clone());
             debug!(
-                "Aggregated receipt from {from}: stanza={stanza_id} \
+                "Aggregated receipt from {}: stanza={stanza_id} \
                  message_id={agg_msg_id:?} key={agg_key:?} users={}",
+                from.observe(),
                 users.len()
             );
             for user in users {
@@ -189,7 +200,13 @@ impl Client {
                 // aggregated_by_message: each <user> carries its own type;
                 // aggregated_by_type: all users share the receipt-level type.
                 let effective_type = match user.r#type.as_deref() {
-                    Some(t) => ReceiptType::parse(t),
+                    // Apply the receipt-level feature-incapable downgrade to the per-user type
+                    // too, so an aggregated delivery receipt with a feature-incapable LID
+                    // participant doesn't re-emit a delivered tick for it.
+                    Some(t) => wacore::stanza::receipt::downgrade_for_feature_incapable(
+                        nr,
+                        ReceiptType::parse(t),
+                    ),
                     None => receipt_type.clone(),
                 };
                 let r = Receipt {
@@ -197,6 +214,7 @@ impl Client {
                     source: crate::types::message::MessageSource {
                         chat: from.clone(),
                         sender: user.jid,
+                        sender_alt: user.participant_pn,
                         ..Default::default()
                     },
                     timestamp: user_ts,
@@ -213,8 +231,9 @@ impl Client {
             wacore::stanza::receipt::collect_simple_message_ids(nr, &stanza_id, is_view);
 
         debug!(
-            "Received receipt type '{receipt_type:?}' for {} message(s) from {from}",
-            message_ids.len()
+            "Received receipt type '{receipt_type:?}' for {} message(s) from {}",
+            message_ids.len(),
+            from.observe()
         );
 
         let receipt = Receipt {
@@ -222,6 +241,7 @@ impl Client {
             source: crate::types::message::MessageSource {
                 chat: from,
                 sender: default_sender,
+                sender_alt: participant_pn,
                 ..Default::default()
             },
             timestamp: stanza_ts,
@@ -261,7 +281,7 @@ impl Client {
                         .optional_string("call-id")
                         .as_deref()
                         .unwrap_or_default(),
-                    receipt.source.chat,
+                    receipt.source.chat.observe(),
                     child_attrs
                         .optional_string("call-creator")
                         .as_deref()
@@ -291,6 +311,7 @@ impl Client {
     ///   `Send/DeliveryReceiptJob.js`); these are NOT skipped anymore.
     /// - Newsletters and messages without an ID are skipped (newsletters are
     ///   handled by the ack gate, not here).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_delivery", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn send_delivery_receipt(&self, info: &crate::types::message::MessageInfo) {
         if !Self::should_send_delivery_receipt(info) {
             return;
@@ -310,7 +331,7 @@ impl Client {
             ReceiptType::Delivered
         };
         debug!(target: "Client/Receipt", "Sending {} receipt for message {} to {}",
-            receipt_kind.as_wire_str(), info.id, info.source.sender);
+            receipt_kind.as_wire_str(), info.id, info.source.sender.observe());
 
         if let Err(e) = self.send_node(receipt_node).await
             && !matches!(e, crate::client::ClientError::NotConnected)
@@ -339,6 +360,7 @@ impl Client {
     /// Emits a nack so the server stops retransmitting an unrecoverable
     /// failure. Prefer [`Client::send_retry_receipt`] for recoverable
     /// errors (BadMac, NoSession, etc).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_nack", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
     pub(crate) async fn send_nack(
         &self,
         info: &MessageInfo,
@@ -360,7 +382,7 @@ impl Client {
         let nack = build_nack_node(info, &own_pn, reason, failure_reason);
         debug!(target: "Client/Receipt",
             "Sending nack (reason={:?}, code={}) for message {} from {}",
-            reason, reason.code(), info.id, info.source.sender);
+            reason, reason.code(), info.id, info.source.sender.observe());
 
         if let Err(e) = self.send_node(nack).await
             && !matches!(e, crate::client::ClientError::NotConnected)
@@ -373,6 +395,7 @@ impl Client {
     /// Sends read receipts for one or more messages.
     ///
     /// For group messages, pass the message sender as `sender`.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.mark_as_read", level = "debug", skip_all, fields(chat = %chat.observe()), err(Debug)))]
     pub async fn mark_as_read(
         &self,
         chat: &Jid,
@@ -406,7 +429,7 @@ impl Client {
 
         let node = builder.build();
 
-        debug!(target: "Client/Receipt", "Sending read receipt for {} message(s) to {}", message_ids.len(), chat);
+        debug!(target: "Client/Receipt", "Sending read receipt for {} message(s) to {}", message_ids.len(), chat.observe());
 
         self.send_node(node)
             .await
@@ -1423,6 +1446,77 @@ mod tests {
         assert_eq!(receipts[0].source.sender.user, "99000000000001");
         assert_eq!(receipts[1].r#type, ReceiptType::Read);
         assert_eq!(receipts[2].r#type, ReceiptType::Inactive);
+    }
+
+    /// participant_pn must land in the Receipt event's sender_alt on both shapes.
+    #[tokio::test]
+    async fn test_receipt_threads_participant_pn_into_sender_alt() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        // Aggregated shape: per-user participant_pn.
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "120363000000000001@g.us")
+                    .attr("id", "STANZA-PPN")
+                    .attr("t", "1700000000")
+                    .children([NodeBuilder::new("participants")
+                        .attr("message_id", "MSG-PPN")
+                        .children([NodeBuilder::new("user")
+                            .attr("jid", "99000000000001@lid")
+                            .attr("participant_pn", "15551234567@s.whatsapp.net")
+                            .attr("type", "read")
+                            .build()])
+                        .build()])
+                    .build(),
+            ))
+            .await;
+
+        // Simple shape: receipt-level participant_pn.
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "99000000000002@lid")
+                    .attr("id", "STANZA-PPN-SIMPLE")
+                    .attr("participant_pn", "15557654321@s.whatsapp.net")
+                    .attr("t", "1700000000")
+                    .build(),
+            ))
+            .await;
+
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+
+        let agg = receipts
+            .iter()
+            .find(|r| r.message_ids.iter().any(|id| id == "MSG-PPN"))
+            .expect("aggregated receipt dispatched");
+        assert_eq!(
+            agg.source.sender_alt.as_ref().expect("sender_alt set").user,
+            "15551234567",
+            "aggregated receipt must thread per-user participant_pn into sender_alt"
+        );
+
+        let simple = receipts
+            .iter()
+            .find(|r| r.message_ids.iter().any(|id| id == "STANZA-PPN-SIMPLE"))
+            .expect("simple receipt dispatched");
+        assert_eq!(
+            simple
+                .source
+                .sender_alt
+                .as_ref()
+                .expect("sender_alt set")
+                .user,
+            "15557654321",
+            "simple receipt must thread receipt-level participant_pn into sender_alt"
+        );
     }
 
     /// Missing per-user `t`: the fan-out event's timestamp falls back to

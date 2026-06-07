@@ -100,7 +100,7 @@ impl<'a> Signal<'a> {
         let mut adapter = self.client.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-        let plaintext = message_decrypt(
+        let decrypted = message_decrypt(
             &parsed,
             &signal_addr,
             &mut adapter.session_store,
@@ -112,10 +112,19 @@ impl<'a> Signal<'a> {
         )
         .await?;
 
+        // A pkmsg consumed prekey is reported, not deleted by the decrypt; buffer
+        // it so the flush below removes it atomically with the promoted session.
+        if let Some(prekey_id) = decrypted.consumed_prekey_id {
+            adapter
+                .pre_key_store
+                .buffer_consumed_prekey(prekey_id, &signal_addr)
+                .await;
+        }
+
         drop(_guard);
         self.client.flush_signal_cache().await?;
 
-        Ok(plaintext.to_vec())
+        Ok(decrypted.plaintext)
     }
 
     /// Encrypt plaintext for a group using sender keys.

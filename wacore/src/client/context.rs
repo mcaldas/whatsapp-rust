@@ -2,6 +2,7 @@ use crate::libsignal::protocol::PreKeyBundle;
 use crate::types::message::AddressingMode;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 use wacore_binary::CompactString;
 use wacore_binary::Jid;
 
@@ -126,15 +127,15 @@ impl GroupInfo {
         }
     }
 
-    /// Convert a phone-based device JID to a LID-based device JID using the mapping.
-    /// If no mapping exists, returns the original JID unchanged.
-    pub fn phone_device_jid_to_lid(&self, phone_device_jid: &Jid) -> Jid {
+    /// Convert a phone-based device JID to a LID-based device JID using the mapping,
+    /// consuming the JID. If no mapping exists, returns it unchanged.
+    pub fn phone_device_jid_into_lid(&self, phone_device_jid: Jid) -> Jid {
         if phone_device_jid.is_pn()
             && let Some(lid_base) = self.lid_jid_for_phone_user(&phone_device_jid.user)
         {
             return Jid::lid_device(lid_base.user.clone(), phone_device_jid.device);
         }
-        phone_device_jid.clone()
+        phone_device_jid
     }
 }
 
@@ -153,7 +154,7 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         jids: &[Jid],
     ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error>;
 
-    async fn resolve_group_info(&self, jid: &Jid) -> Result<GroupInfo, anyhow::Error>;
+    async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, anyhow::Error>;
 
     /// Get the LID (Linked ID) for a phone number, if known.
     /// This is used to find existing sessions that were established under a LID address
@@ -164,6 +165,16 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         // Default implementation returns None - subclasses can override
         let _ = phone_user;
         None
+    }
+
+    /// Notify that establishing a session for `jid` replaced a previously-stored
+    /// identity key (local detection of a peer identity change on the send path).
+    ///
+    /// Default is a no-op; the high-level client reacts off-path (mirrors WA Web
+    /// `saveIdentity` -> `handleNewIdentity`). The resolver is the only handle
+    /// back to the client available inside `encrypt_for_devices`.
+    fn on_local_identity_change(&self, jid: &Jid) {
+        let _ = jid;
     }
 }
 

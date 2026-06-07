@@ -30,9 +30,11 @@ impl MessageUtils {
         buf
     }
 
-    pub fn participant_list_hash(devices: &[wacore_binary::Jid]) -> Result<String> {
+    pub fn participant_list_hash<'a>(
+        devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
+    ) -> Result<String> {
         // Hash sorted ad_strings incrementally (avoids join() allocation).
-        let mut jids: Vec<String> = devices.iter().map(|j| j.to_ad_string()).collect();
+        let mut jids: Vec<String> = devices.into_iter().map(|j| j.to_ad_string()).collect();
         jids.sort_unstable();
 
         let mut h = CryptographicHash::new("SHA-256")
@@ -48,10 +50,10 @@ impl MessageUtils {
         // Standard base64 ('+'/'/'), matching whatsmeow (`base64.RawStdEncoding`)
         // and WA Web (`WABase64.encodeB64`). URL-safe ('-'/'_') diverges from the
         // server on ~22% of phashes (any output hitting base64 index 62/63).
-        Ok(format!(
-            "2:{hash}",
-            hash = base64::prelude::BASE64_STANDARD_NO_PAD.encode(&full_hash[..6])
-        ))
+        let mut out = String::with_capacity(10);
+        out.push_str("2:");
+        base64::prelude::BASE64_STANDARD_NO_PAD.encode_string(&full_hash[..6], &mut out);
+        Ok(out)
     }
 
     /// Validate a broadcast-contact-list hash from an incoming `deviceSentMessage`
@@ -97,6 +99,22 @@ pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
 }
 
+/// Wrap a message into a DeviceSentMessage for own-device sync, hoisting
+/// `message_context_info` onto the outer message (matching WA Web). Inverse of
+/// [`unwrap_device_sent`].
+pub fn wrap_device_sent(mut message: wa::Message, destination_jid: String) -> wa::Message {
+    let context = message.message_context_info.take();
+    wa::Message {
+        message_context_info: context,
+        device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+            destination_jid: Some(destination_jid),
+            message: Some(Box::new(message)),
+            phash: None,
+        })),
+        ..Default::default()
+    }
+}
+
 /// Unwrap a DeviceSentMessage wrapper, returning the inner message.
 ///
 /// When a message is sent from our own device, the actual content is nested
@@ -124,7 +142,7 @@ pub fn unwrap_device_sent(mut msg: wa::Message) -> wa::Message {
 /// When sending a group message, WhatsApp includes the SKDM in a separate
 /// `pkmsg` enc node.  We must process it (store the sender key) but should
 /// not surface it as a user event.
-pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
+pub fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
     if msg.sender_key_distribution_message.is_none()
         && msg
             .fast_ratchet_key_sender_key_distribution_message
@@ -133,7 +151,7 @@ pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
         return false;
     }
 
-    // Fast path: most common user-visible fields (avoids clone for the typical case).
+    // Fast path: most common user-visible fields (avoids the slow path for the typical case).
     if msg.conversation.is_some()
         || msg.extended_text_message.is_some()
         || msg.image_message.is_some()
@@ -146,12 +164,20 @@ pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
         return false;
     }
 
-    // Slow path: clone and compare to default to catch all current and future fields.
-    let mut stripped = msg.clone();
-    stripped.sender_key_distribution_message = None;
-    stripped.fast_ratchet_key_sender_key_distribution_message = None;
-    stripped.message_context_info = None;
-    stripped == wa::Message::default()
+    // Slow path: temporarily take out the carrier fields and compare the rest to
+    // default to catch all current and future fields, then restore them. This
+    // avoids deep-cloning the whole Message just to clear three fields.
+    let skdm = msg.sender_key_distribution_message.take();
+    let fast = msg.fast_ratchet_key_sender_key_distribution_message.take();
+    let ctx = msg.message_context_info.take();
+
+    let only = *msg == wa::Message::default();
+
+    msg.sender_key_distribution_message = skdm;
+    msg.fast_ratchet_key_sender_key_distribution_message = fast;
+    msg.message_context_info = ctx;
+
+    only
 }
 
 /// Parse a message stanza into a `MessageInfo` struct.
@@ -738,6 +764,90 @@ mod parse_message_info_tests {
         assert!(
             info.bcl_participants.is_empty(),
             "group fanout participants are not a bcl"
+        );
+    }
+}
+
+#[cfg(test)]
+mod device_sent_tests {
+    use super::*;
+
+    fn msg_with_secret(secret: &[u8]) -> wa::Message {
+        wa::Message {
+            conversation: Some("hi".into()),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(secret.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wrap_hoists_context_to_outer_on_wire() {
+        let secret = [7u8; 32];
+        let wrapped = wrap_device_sent(msg_with_secret(&secret), "1@s.whatsapp.net".into());
+
+        let bytes = wrapped.encode_to_vec();
+        let decoded = wa::Message::decode(bytes.as_slice()).unwrap();
+
+        assert_eq!(
+            decoded
+                .message_context_info
+                .and_then(|c| c.message_secret)
+                .as_deref(),
+            Some(secret.as_slice())
+        );
+        let inner = decoded.device_sent_message.unwrap().message.unwrap();
+        assert!(inner.message_context_info.is_none());
+        assert_eq!(inner.conversation.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn wrap_without_context_leaves_outer_empty() {
+        let inner = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        let wrapped = wrap_device_sent(inner, "1@s.whatsapp.net".into());
+
+        assert!(wrapped.message_context_info.is_none());
+        let dsm = wrapped.device_sent_message.unwrap();
+        assert_eq!(dsm.destination_jid.as_deref(), Some("1@s.whatsapp.net"));
+        assert!(dsm.message.unwrap().message_context_info.is_none());
+    }
+
+    #[test]
+    fn wrap_then_unwrap_preserves_non_secret_context_fields() {
+        let inner = wa::Message {
+            message_context_info: Some(wa::MessageContextInfo {
+                message_add_on_duration_in_secs: Some(604800),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let unwrapped = unwrap_device_sent(wrap_device_sent(inner, "1@s.whatsapp.net".into()));
+        assert_eq!(
+            unwrapped
+                .message_context_info
+                .and_then(|c| c.message_add_on_duration_in_secs),
+            Some(604800)
+        );
+    }
+
+    #[test]
+    fn wrap_then_unwrap_round_trips_secret() {
+        let secret = [9u8; 32];
+        let wrapped = wrap_device_sent(msg_with_secret(&secret), "1@s.whatsapp.net".into());
+        let unwrapped = unwrap_device_sent(wrapped);
+
+        assert_eq!(unwrapped.conversation.as_deref(), Some("hi"));
+        assert_eq!(
+            unwrapped
+                .message_context_info
+                .and_then(|c| c.message_secret)
+                .as_deref(),
+            Some(secret.as_slice())
         );
     }
 }

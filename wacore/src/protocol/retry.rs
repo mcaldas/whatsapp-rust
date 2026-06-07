@@ -5,6 +5,10 @@
 //! (session management, message resend, cache interaction) remains in
 //! `whatsapp-rust/src/retry.rs`.
 
+use crate::iq::prekeys::{OneTimePreKeyNode, SignedPreKeyNode};
+use crate::libsignal::protocol::PublicKey;
+use crate::protocol::ProtocolNode;
+use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeContent};
 
 /// Maximum retry attempts we'll honor (matches WhatsApp Web's MAX_RETRY = 5).
@@ -57,6 +61,28 @@ pub enum RetryReason {
     StatusRevokeDelay = 13,
 }
 
+impl RetryReason {
+    /// Stable, low-cardinality label for metrics and logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnknownError => "unknown",
+            Self::NoSession => "no_session",
+            Self::InvalidKey => "invalid_key",
+            Self::InvalidKeyId => "invalid_key_id",
+            Self::InvalidMessage => "invalid_message",
+            Self::InvalidSignature => "invalid_signature",
+            Self::FutureMessage => "future_message",
+            Self::BadMac => "bad_mac",
+            Self::InvalidSession => "invalid_session",
+            Self::InvalidMsgKey => "invalid_msg_key",
+            Self::BadBroadcastEphemeralSetting => "bad_broadcast_ephemeral",
+            Self::UnknownCompanionNoPrekey => "unknown_companion",
+            Self::AdvFailure => "adv_failure",
+            Self::StatusRevokeDelay => "status_revoke_delay",
+        }
+    }
+}
+
 /// Helper to extract bytes content from a Node.
 pub fn get_bytes_content(node: &Node) -> Option<&[u8]> {
     match &node.content {
@@ -100,6 +126,41 @@ pub fn should_include_keys(retry_count: u8, reason: RetryReason) -> bool {
     let include_keys_early =
         reason == RetryReason::NoSession || reason == RetryReason::UnknownCompanionNoPrekey;
     retry_count >= MIN_RETRY_COUNT_FOR_KEYS || include_keys_early
+}
+
+/// Builds the `<keys>` bundle embedded in a retry receipt (type, identity, one-time prekey,
+/// signed prekey, device identity) so a peer can re-establish the Signal session.
+///
+/// Every public key `<value>` is the raw 32-byte curve key (`public_key_bytes`), not the
+/// 33-byte Signal-serialized form: this matches WA Web's xmppPreKey/xmppSignedPreKey and the
+/// prekey upload path, and is what a peer's prekey parser expects.
+pub fn build_retry_keys_node(
+    identity_pub: &PublicKey,
+    prekey_id: u32,
+    prekey_pub: &PublicKey,
+    signed_prekey_id: u32,
+    signed_prekey_pub: &PublicKey,
+    signed_prekey_signature: Vec<u8>,
+    device_identity: Vec<u8>,
+) -> Node {
+    NodeBuilder::new("keys")
+        .children([
+            NodeBuilder::new("type").bytes(vec![5u8]).build(),
+            NodeBuilder::new("identity")
+                .bytes(identity_pub.public_key_bytes().to_vec())
+                .build(),
+            OneTimePreKeyNode::new(prekey_id, prekey_pub.public_key_bytes().to_vec()).into_node(),
+            SignedPreKeyNode::new(
+                signed_prekey_id,
+                signed_prekey_pub.public_key_bytes().to_vec(),
+                signed_prekey_signature,
+            )
+            .into_node(),
+            NodeBuilder::new("device-identity")
+                .bytes(device_identity)
+                .build(),
+        ])
+        .build()
 }
 
 #[cfg(test)]
@@ -236,5 +297,73 @@ mod tests {
         assert_eq!(MAX_RETRY_COUNT, 5);
         assert_eq!(MIN_RETRY_COUNT_FOR_KEYS, 2);
         assert_eq!(MIN_RETRY_FOR_BASE_KEY_CHECK, 2);
+    }
+
+    #[test]
+    fn retry_keys_bundle_emits_raw_32_byte_curve_values() {
+        // WhatsApp Web's xmppPreKey / xmppSignedPreKey carry the raw 32-byte curve public key in
+        // <value>; a peer parses the retry <keys> bundle expecting exactly that, so the prekey and
+        // signed prekey values must parse with the prekey parsers (which require 32 bytes).
+        use crate::libsignal::protocol::KeyPair;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let identity = KeyPair::generate(&mut rng);
+        let prekey = KeyPair::generate(&mut rng);
+        let signed_prekey = KeyPair::generate(&mut rng);
+
+        let keys = build_retry_keys_node(
+            &identity.public_key,
+            201,
+            &prekey.public_key,
+            100,
+            &signed_prekey.public_key,
+            vec![7u8; 64],
+            vec![9u8; 16],
+        );
+
+        let key_node = keys.get_optional_child("key").expect("<key> child present");
+        let parsed_prekey =
+            OneTimePreKeyNode::try_from_node(key_node).expect("one-time prekey should parse");
+        assert_eq!(
+            parsed_prekey.public_bytes.as_slice(),
+            prekey.public_key.public_key_bytes()
+        );
+
+        let skey_node = keys
+            .get_optional_child("skey")
+            .expect("<skey> child present");
+        let parsed_skey =
+            SignedPreKeyNode::try_from_node(skey_node).expect("signed prekey should parse");
+        assert_eq!(
+            parsed_skey.public_bytes.as_slice(),
+            signed_prekey.public_key.public_key_bytes()
+        );
+    }
+
+    // These strings are metric label values; drift silently breaks dashboards.
+    #[test]
+    fn retry_reason_as_str_is_stable() {
+        let cases = [
+            (RetryReason::UnknownError, "unknown"),
+            (RetryReason::NoSession, "no_session"),
+            (RetryReason::InvalidKey, "invalid_key"),
+            (RetryReason::InvalidKeyId, "invalid_key_id"),
+            (RetryReason::InvalidMessage, "invalid_message"),
+            (RetryReason::InvalidSignature, "invalid_signature"),
+            (RetryReason::FutureMessage, "future_message"),
+            (RetryReason::BadMac, "bad_mac"),
+            (RetryReason::InvalidSession, "invalid_session"),
+            (RetryReason::InvalidMsgKey, "invalid_msg_key"),
+            (
+                RetryReason::BadBroadcastEphemeralSetting,
+                "bad_broadcast_ephemeral",
+            ),
+            (RetryReason::UnknownCompanionNoPrekey, "unknown_companion"),
+            (RetryReason::AdvFailure, "adv_failure"),
+            (RetryReason::StatusRevokeDelay, "status_revoke_delay"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(reason.as_str(), expected);
+        }
     }
 }

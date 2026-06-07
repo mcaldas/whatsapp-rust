@@ -4,6 +4,7 @@ mod chatstate;
 mod community;
 mod contacts;
 mod groups;
+pub(crate) mod labels;
 mod media_reupload;
 pub mod message_edit;
 mod mex;
@@ -11,6 +12,7 @@ pub(crate) mod newsletter;
 mod polls;
 mod presence;
 mod profile;
+mod reaction;
 mod signal;
 pub(crate) mod status;
 mod tctoken;
@@ -35,6 +37,8 @@ pub use groups::{
     MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
     ParticipantType, PictureType,
 };
+
+pub use labels::Labels;
 
 pub use media_reupload::{MediaRetryResult, MediaReupload, MediaReuploadRequest};
 

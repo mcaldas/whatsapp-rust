@@ -511,14 +511,9 @@ pub fn merge_dsm_context(
             inner.limit_sharing_v2 = None;
             Some(inner)
         }
-        (None, Some(outer)) => Some(wa::MessageContextInfo {
-            message_secret: outer.message_secret.clone(),
-            message_association: outer.message_association.clone(),
-            limit_sharing_v2: outer.limit_sharing_v2,
-            thread_id: outer.thread_id.clone(),
-            bot_metadata: outer.bot_metadata.clone(),
-            ..Default::default()
-        }),
+        // Inner was cleared by a WA-Web-style hoist; restore the full context the
+        // sender moved to the outer message, not just the merge subset.
+        (None, Some(outer)) => Some(outer.clone()),
         (Some(mut inner), Some(outer)) => {
             if inner.message_secret.is_none() {
                 inner.message_secret = outer.message_secret.clone();
@@ -582,22 +577,31 @@ pub fn build_quote_context(
     }
 }
 
-/// Builds a quote ContextInfo matching WA Web's EProtoGenerator + getQuotedParticipantForContextInfo.
+/// Builds a quote ContextInfo matching WA Web's `msgContextInfo` + `getQuotedParticipantForContextInfo`.
 ///
-/// Sets `remote_jid` (required by iOS to scope the quote) and resolves `participant`
-/// based on chat type (newsletter → channel JID, otherwise → sender JID).
+/// `remote_jid` is emitted only for a cross-chat quote (the quoted message's
+/// chat differs from `target_chat_jid`), mirroring WA Web's quote-context getter
+/// (`remoteJid` set only when `quotedMsg.remote != targetChat`); a same-chat
+/// reply omits it. The defense against re-notifying mentions inside the quoted
+/// copy is `prepare_for_quote`, not `remote_jid`.
+/// `participant`: newsletter uses the channel JID, otherwise the sender.
 pub fn build_quote_context_with_info(
     message_id: impl Into<String>,
     sender_jid: &Jid,
-    chat_jid: &Jid,
+    quoted_chat_jid: &Jid,
+    target_chat_jid: &Jid,
     quoted_message: &wa::Message,
 ) -> wa::ContextInfo {
-    // WA Web always sets remoteJid to the chat JID (EProtoGenerator.js:108).
-    let remote_jid = chat_jid.to_string();
+    // remote_jid only for a cross-chat quote, in device-less chat form: a chat
+    // reference carries no device, and the compare above is device-insensitive.
+    // with_device(0) keeps the agent that @bot/@interop chat JIDs render (to_non_ad
+    // would wrongly drop it).
+    let remote_jid = (!quoted_chat_jid.is_same_chat_as(target_chat_jid))
+        .then(|| quoted_chat_jid.with_device(0).to_string());
 
     // Newsletter quotes use the channel JID as participant; others use the sender.
-    let participant = if chat_jid.is_newsletter() {
-        remote_jid.clone()
+    let participant = if quoted_chat_jid.is_newsletter() {
+        quoted_chat_jid.to_string()
     } else {
         sender_jid.to_string()
     };
@@ -605,8 +609,30 @@ pub fn build_quote_context_with_info(
     wa::ContextInfo {
         stanza_id: Some(message_id.into()),
         participant: Some(participant),
-        remote_jid: Some(remote_jid),
+        remote_jid,
         quoted_message: Some(quoted_message.prepare_for_quote()),
+        ..Default::default()
+    }
+}
+
+/// Builds a `reactionMessage` matching WA Web's `WAWebReactionsGenerateReactionMessageProto`
+/// (`{ key, text, senderTimestampMs }`).
+///
+/// `key` references the message being reacted to. An empty `emoji` is the
+/// remove-reaction form: the wire stays a `reactionMessage` with empty `text`,
+/// which the edit-attr classifier treats as a sender-revoke of the prior reaction.
+pub fn build_reaction_message(
+    key: wa::MessageKey,
+    emoji: impl Into<String>,
+    sender_timestamp_ms: i64,
+) -> wa::Message {
+    wa::Message {
+        reaction_message: Some(wa::message::ReactionMessage {
+            key: Some(key),
+            text: Some(emoji.into()),
+            sender_timestamp_ms: Some(sender_timestamp_ms),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -1376,7 +1402,7 @@ mod tests {
         let chat: Jid = "1234567890@newsletter".parse().unwrap();
         let msg = wa::Message::default();
 
-        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &msg);
+        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &chat, &msg);
 
         assert_eq!(
             ctx.participant.as_deref(),
@@ -1393,7 +1419,7 @@ mod tests {
         let chat: Jid = "group@g.us".parse().unwrap();
         let msg = wa::Message::default();
 
-        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &msg);
+        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &chat, &msg);
 
         assert_eq!(
             ctx.participant.as_deref(),
@@ -1409,7 +1435,7 @@ mod tests {
         let chat: Jid = "status@broadcast".parse().unwrap();
         let msg = wa::Message::default();
 
-        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &msg);
+        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &chat, &msg);
 
         assert_eq!(
             ctx.participant.as_deref(),
@@ -1551,6 +1577,20 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_dsm_context_outer_only_preserves_non_subset_fields() {
+        let outer = wa::MessageContextInfo {
+            message_add_on_duration_in_secs: Some(86400),
+            ..Default::default()
+        };
+        let result = merge_dsm_context(None, Some(&outer)).unwrap();
+        assert_eq!(
+            result.message_add_on_duration_in_secs,
+            Some(86400),
+            "hoisted fields outside the merge subset must survive unwrap"
+        );
+    }
+
+    #[test]
     fn test_merge_dsm_context_inner_preferred_for_secret() {
         let inner = wa::MessageContextInfo {
             message_secret: Some(vec![1, 2, 3]),
@@ -1650,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn quote_context_sets_remote_jid_for_group() {
+    fn quote_context_omits_remote_jid_same_chat_group() {
         let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let msg = wa::Message {
@@ -1658,20 +1698,21 @@ mod tests {
             ..Default::default()
         };
 
-        let ctx = build_quote_context_with_info("msg-id-123", &sender, &group, &msg);
+        // Same-chat reply (quoted chat == target): WA Web omits remote_jid.
+        let ctx = build_quote_context_with_info("msg-id-123", &sender, &group, &group, &msg);
 
         assert_eq!(ctx.stanza_id.as_deref(), Some("msg-id-123"));
         assert_eq!(
             ctx.participant.as_deref(),
             Some("551199887766@s.whatsapp.net")
         );
-        assert_eq!(ctx.remote_jid.as_deref(), Some("120363098765432100@g.us"));
+        assert_eq!(ctx.remote_jid, None);
         assert!(ctx.quoted_message.is_some());
         assert!(ctx.mentioned_jid.is_empty());
     }
 
     #[test]
-    fn quote_context_sets_remote_jid_for_dm() {
+    fn quote_context_omits_remote_jid_same_chat_dm() {
         let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
         let chat: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
         let msg = wa::Message {
@@ -1679,14 +1720,73 @@ mod tests {
             ..Default::default()
         };
 
-        let ctx = build_quote_context_with_info("msg-id-456", &sender, &chat, &msg);
+        let ctx = build_quote_context_with_info("msg-id-456", &sender, &chat, &chat, &msg);
+
+        assert_eq!(ctx.remote_jid, None);
+        assert_eq!(
+            ctx.participant.as_deref(),
+            Some("551199887766@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn quote_context_emits_remote_jid_cross_chat() {
+        // Quoting a message from group A while sending into group B.
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let quoted_chat: Jid = "120363000000000001@g.us".parse().unwrap();
+        let target_chat: Jid = "120363000000000002@g.us".parse().unwrap();
+        let msg = wa::Message {
+            conversation: Some("cross".into()),
+            ..Default::default()
+        };
+
+        let ctx =
+            build_quote_context_with_info("msg-id-x", &sender, &quoted_chat, &target_chat, &msg);
+
+        assert_eq!(ctx.remote_jid.as_deref(), Some("120363000000000001@g.us"));
+    }
+
+    #[test]
+    fn quote_context_status_reply_is_cross_chat() {
+        // Replying in a DM to a status: status@broadcast != DM target.
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let status: Jid = "status@broadcast".parse().unwrap();
+        let target: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let msg = wa::Message::default();
+
+        let ctx = build_quote_context_with_info("msg-id-s", &sender, &status, &target, &msg);
+
+        assert_eq!(ctx.remote_jid.as_deref(), Some("status@broadcast"));
+    }
+
+    #[test]
+    fn quote_context_device_suffix_treated_as_same_chat() {
+        // is_same_chat_as ignores the device suffix, so this stays a same-chat reply.
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let quoted_chat: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let target_chat = quoted_chat.with_device(5);
+        let msg = wa::Message::default();
+
+        let ctx =
+            build_quote_context_with_info("msg-id-d", &sender, &quoted_chat, &target_chat, &msg);
+
+        assert_eq!(ctx.remote_jid, None);
+    }
+
+    #[test]
+    fn quote_context_cross_chat_remote_jid_drops_device_suffix() {
+        // A device-scoped quoted chat must emit a device-less remote_jid: a chat
+        // reference carries no device.
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let quoted_chat = sender.with_device(5);
+        let target_chat: Jid = "5521988776655@s.whatsapp.net".parse().unwrap();
+        let msg = wa::Message::default();
+
+        let ctx =
+            build_quote_context_with_info("msg-id-dev", &sender, &quoted_chat, &target_chat, &msg);
 
         assert_eq!(
             ctx.remote_jid.as_deref(),
-            Some("551199887766@s.whatsapp.net")
-        );
-        assert_eq!(
-            ctx.participant.as_deref(),
             Some("551199887766@s.whatsapp.net")
         );
     }
@@ -1697,7 +1797,27 @@ mod tests {
         let newsletter: Jid = "120363099999999999@newsletter".parse().unwrap();
         let msg = wa::Message::default();
 
-        let ctx = build_quote_context_with_info("msg-id-789", &sender, &newsletter, &msg);
+        // Same-chat newsletter reply: participant stays the channel; remote_jid omitted.
+        let ctx =
+            build_quote_context_with_info("msg-id-789", &sender, &newsletter, &newsletter, &msg);
+
+        assert_eq!(
+            ctx.participant.as_deref(),
+            Some("120363099999999999@newsletter")
+        );
+        assert_eq!(ctx.remote_jid, None);
+    }
+
+    #[test]
+    fn quote_context_newsletter_cross_chat_sets_both() {
+        // Quoting a newsletter post while sending into a different newsletter:
+        // participant stays the quoted channel AND remote_jid is emitted.
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let quoted: Jid = "120363099999999999@newsletter".parse().unwrap();
+        let target: Jid = "120363011111111111@newsletter".parse().unwrap();
+        let msg = wa::Message::default();
+
+        let ctx = build_quote_context_with_info("msg-id-nx", &sender, &quoted, &target, &msg);
 
         assert_eq!(
             ctx.participant.as_deref(),
@@ -1715,7 +1835,7 @@ mod tests {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let msg = create_message_with_mentions();
 
-        let ctx = build_quote_context_with_info("msg-id", &sender, &group, &msg);
+        let ctx = build_quote_context_with_info("msg-id", &sender, &group, &group, &msg);
 
         // The quoted message's nested context_info should have mentions stripped
         let quoted = ctx.quoted_message.unwrap();
@@ -2087,5 +2207,71 @@ mod tests {
             ..Default::default()
         };
         assert!(!not_fwd.is_forwarded());
+    }
+
+    fn group_target_key() -> wa::MessageKey {
+        wa::MessageKey {
+            remote_jid: Some("120363012345@g.us".to_string()),
+            from_me: Some(false),
+            id: Some("ABCD1234".to_string()),
+            participant: Some("15551230000@s.whatsapp.net".to_string()),
+        }
+    }
+
+    #[test]
+    fn build_reaction_populates_key_text_and_timestamp() {
+        let key = group_target_key();
+        let ts = 1_700_000_000_000;
+        let msg = build_reaction_message(key.clone(), "👍", ts);
+
+        let react = msg
+            .reaction_message
+            .as_ref()
+            .expect("reaction_message must be set");
+        assert_eq!(react.key.as_ref(), Some(&key));
+        assert_eq!(react.text.as_deref(), Some("👍"));
+        assert_eq!(react.sender_timestamp_ms, Some(ts));
+        // Only the reaction field is populated.
+        assert!(msg.conversation.is_none());
+        assert!(react.grouping_key.is_none());
+    }
+
+    #[test]
+    fn build_reaction_preserves_participant_for_group_target() {
+        let key = group_target_key();
+        let msg = build_reaction_message(key, "❤️", 1);
+        let participant = msg
+            .reaction_message
+            .and_then(|r| r.key)
+            .and_then(|k| k.participant);
+        assert_eq!(participant.as_deref(), Some("15551230000@s.whatsapp.net"));
+    }
+
+    #[test]
+    fn build_reaction_empty_emoji_is_unreact_form() {
+        // Empty text stays a reaction with present-but-empty text (not None),
+        // which the edit-attr classifier maps to a sender-revoke.
+        let msg = build_reaction_message(group_target_key(), "", 1);
+        let text = msg
+            .reaction_message
+            .as_ref()
+            .and_then(|r| r.text.as_deref());
+        assert_eq!(text, Some(""));
+    }
+
+    #[test]
+    fn build_reaction_edit_attr_classification() {
+        use crate::types::message::EditAttribute;
+
+        // A non-empty reaction is a regular send, not an edit/revoke.
+        let react = build_reaction_message(group_target_key(), "🔥", 1);
+        assert_eq!(EditAttribute::infer_from_message(&react), None);
+
+        // An empty reaction is the sender-revoke of a previous reaction.
+        let unreact = build_reaction_message(group_target_key(), "", 1);
+        assert_eq!(
+            EditAttribute::infer_from_message(&unreact),
+            Some(EditAttribute::SenderRevoke)
+        );
     }
 }

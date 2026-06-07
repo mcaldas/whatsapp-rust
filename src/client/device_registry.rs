@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use log::{debug, info, warn};
+use std::sync::Arc;
 use wacore_binary::Jid;
 
 use super::Client;
@@ -89,10 +90,9 @@ impl Client {
         UserLookupKeys::Unknown { user: user.into() }
     }
 
-    /// Get all possible lookup keys for a user (for bidirectional lookup).
-    /// Returns keys in order of preference: [canonical_key, fallback_key].
-    ///
-    /// Note: Prefer `resolve_lookup_keys` when you need type information.
+    /// Owned-key variant of `resolve_lookup_keys`. Test-only: production callers
+    /// use the borrowed `resolve_lookup_keys(..).all_keys()` to avoid the churn.
+    #[cfg(test)]
     pub(crate) async fn get_lookup_keys(&self, user: &str) -> Vec<String> {
         self.resolve_lookup_keys(user)
             .await
@@ -115,24 +115,26 @@ impl Client {
             return true;
         }
 
-        let lookup_keys = self.get_lookup_keys(user).await;
+        // Borrowed `&str` keys (like get_devices_from_registry), bound once so both
+        // loops share one Vec<&str>: avoids the per-message get_lookup_keys churn.
+        let lookup = self.resolve_lookup_keys(user).await;
+        let keys = lookup.all_keys();
 
-        for key in &lookup_keys {
+        for &key in &keys {
             if let Some(record) = self.device_registry_cache.get(key).await {
                 return record.devices.iter().any(|d| d.device_id == device_id);
             }
         }
 
         let backend = self.persistence_manager.backend();
-        for key in &lookup_keys {
+        for &key in &keys {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     let has_device = record.devices.iter().any(|d| d.device_id == device_id);
-                    // Cache under the record's actual user key (the key it was stored under
-                    // in the backend), not lookup_keys[0] which is our guessed canonical key.
-                    // This ensures consistency between the in-memory cache and the backend.
+                    // Cache under the record's actual stored key, not our guessed one,
+                    // to keep the cache and backend consistent.
                     self.device_registry_cache
-                        .insert(record.user.clone(), record)
+                        .insert(record.user.clone(), Arc::new(record))
                         .await;
                     return has_device;
                 }
@@ -148,6 +150,15 @@ impl Client {
 
     /// Update the device list for a user.
     /// Stores under LID when mapping is known, otherwise under PN.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.update_device_list",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn update_device_list(
         &self,
         mut record: wacore::store::traits::DeviceListRecord,
@@ -164,7 +175,7 @@ impl Client {
 
         // Use canonical_key directly as cache key (no extra clone)
         self.device_registry_cache
-            .insert(canonical_key.clone(), record_for_cache)
+            .insert(canonical_key.clone(), Arc::new(record_for_cache))
             .await;
 
         let backend = self.persistence_manager.backend();
@@ -201,6 +212,7 @@ impl Client {
     /// collapses into a single transaction. Used by usync after fetching
     /// device lists for many users at once, where the per-row commit
     /// dominated wall-clock time on large groups.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.update_device_lists", level = "debug", skip_all, fields(count = records.len()), err(Debug)))]
     pub(crate) async fn update_device_lists(
         &self,
         records: Vec<wacore::store::traits::DeviceListRecord>,
@@ -222,7 +234,7 @@ impl Client {
 
             let record_for_cache = record.clone();
             self.device_registry_cache
-                .insert(canonical_key.clone(), record_for_cache)
+                .insert(canonical_key.clone(), Arc::new(record_for_cache))
                 .await;
 
             if canonical_key != original_user {
@@ -255,10 +267,41 @@ impl Client {
         Ok(())
     }
 
+    /// Spawn the local identity-change reaction off the current path so it runs
+    /// after any held session lock is released (the reaction acquires its own
+    /// locks and must not deadlock against an in-flight decrypt/encrypt batch).
+    ///
+    /// Triggered from both the inbound decrypt path and the outbound
+    /// session-establishment paths when `save_identity` reports
+    /// [`IdentityChange::ReplacedExisting`](wacore::libsignal::protocol::IdentityChange),
+    /// mirroring WA Web `saveIdentity` -> `handleNewIdentity`. Gating
+    /// (primary-device, skip-self) lives in [`handle_local_identity_change`].
+    ///
+    /// [`handle_local_identity_change`]: crate::handlers::notification::handle_local_identity_change
+    pub(crate) fn react_to_local_identity_change(&self, sender: &Jid) {
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let sender = sender.clone();
+        self.runtime
+            .spawn(Box::pin(async move {
+                crate::handlers::notification::handle_local_identity_change(&client, sender).await;
+            }))
+            .detach();
+    }
+
     /// Invalidate cached device data for a specific user.
     ///
     /// Removes all device registry cache entries (all LID/PN aliases) so the
     /// next lookup falls through to the database or network.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.invalidate_device_cache",
+            level = "debug",
+            skip_all
+        )
+    )]
     pub(crate) async fn invalidate_device_cache(&self, user: &str) {
         let lookup = self.resolve_lookup_keys(user).await;
 
@@ -287,6 +330,10 @@ impl Client {
     /// New devices need no explicit cache invalidation: `resolve_skdm_targets`
     /// queries the registry on each send and `device_has_key()` returns `None`
     /// for unseen device IDs, dropping them into `needs_skdm` automatically.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.session.patch_device_add", level = "debug", skip_all)
+    )]
     pub(crate) async fn patch_device_add(
         &self,
         user: &str,
@@ -391,6 +438,15 @@ impl Client {
     /// Matches WA Web's `clearDeviceRecord()` in `IdentityUpdateDeviceTableApi`:
     /// - Deletes Signal sessions for non-primary devices (stale identity)
     /// - Invalidates sender key device cache so SKDM will be redistributed
+    ///
+    /// The companion-device session wipe is intentionally not per-device locked
+    /// (matches WA Web's single-threaded model). A concurrent encrypt to one of
+    /// those companions can re-store a session right after the wipe, but that is
+    /// self-healing: the next send re-establishes it via `process_prekey_bundle`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.session.clear_device_record", level = "debug", skip_all)
+    )]
     pub(crate) async fn clear_device_record(
         &self,
         user: &str,
@@ -422,6 +478,7 @@ impl Client {
     /// (`UpdateDeviceTableApi`): deletes Signal sessions for the device,
     /// then invalidates the sender key device cache so SKDM will be
     /// redistributed on the next group send.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.patch_device_remove", level = "debug", skip_all, fields(device_id = device_id)))]
     pub(crate) async fn patch_device_remove(&self, user: &str, device_id: u32) {
         if let Some(mut record) = self.load_device_record(user).await {
             let before = record.devices.len();
@@ -477,6 +534,7 @@ impl Client {
     /// Cache eviction runs only after the DB delete succeeds; on failure the
     /// error is propagated so the caller can leave both DB and cache in their
     /// pre-call state rather than half-applying the cleanup.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.delete_sender_key_rows", level = "debug", skip_all, fields(device_id = device_id), err(Debug)))]
     async fn delete_sender_key_rows_for_device(
         &self,
         user: &str,
@@ -506,6 +564,10 @@ impl Client {
     }
 
     /// Update key_index for a device in the registry.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.session.patch_device_update", level = "debug", skip_all)
+    )]
     pub(crate) async fn patch_device_update(
         &self,
         user: &str,
@@ -532,7 +594,8 @@ impl Client {
 
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
-                return Some(record);
+                // Cold load-modify-persist path: callers mutate the owned record.
+                return Some((*record).clone());
             }
         }
 
@@ -541,7 +604,7 @@ impl Client {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     self.device_registry_cache
-                        .insert(record.user.clone(), record.clone())
+                        .insert(record.user.clone(), Arc::new(record.clone()))
                         .await;
                     return Some(record);
                 }
@@ -562,6 +625,7 @@ impl Client {
     ///
     /// This follows the same 2-tier pattern as [`has_device`]: registry cache first,
     /// then the backend database.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.get_devices_from_registry", level = "trace", skip_all, fields(peer = %jid.observe())))]
     pub(crate) async fn get_devices_from_registry(&self, jid: &Jid) -> Option<Vec<Jid>> {
         // Use the borrowed `&str` keys directly: both the moka cache and the
         // backend take `&str`, so going through `get_lookup_keys` (which re-owns
@@ -583,7 +647,7 @@ impl Client {
                 Ok(Some(record)) => {
                     let devices = Self::reconstruct_device_jids(jid, &record);
                     self.device_registry_cache
-                        .insert(record.user.clone(), record)
+                        .insert(record.user.clone(), Arc::new(record))
                         .await;
                     return Some(devices);
                 }
@@ -638,6 +702,14 @@ impl Client {
     }
 
     /// Migrate device registry entries from PN key to LID key.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.migrate_device_registry",
+            level = "debug",
+            skip_all
+        )
+    )]
     pub(crate) async fn migrate_device_registry_on_lid_discovery(&self, pn: &str, lid: &str) {
         let backend = self.persistence_manager.backend();
 
@@ -658,7 +730,7 @@ impl Client {
                 }
 
                 self.device_registry_cache
-                    .insert(lid.to_string(), record)
+                    .insert(lid.to_string(), Arc::new(record))
                     .await;
 
                 // Drop the PN-keyed row in both cache and DB. Invalidate
@@ -713,8 +785,29 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert(user.into(), record)
+            .insert(user.into(), Arc::new(record))
             .await;
+    }
+
+    #[tokio::test]
+    async fn warm_registry_hit_shares_arc_not_deep_clone() {
+        let client = create_test_client().await;
+        setup_device_record(&client, "15551112222", &[1, 2]).await;
+
+        let a = client
+            .device_registry_cache
+            .get("15551112222")
+            .await
+            .expect("warm hit");
+        let b = client
+            .device_registry_cache
+            .get("15551112222")
+            .await
+            .expect("warm hit");
+
+        // A warm registry hit returns a refcount bump of the same allocation, not a deep copy.
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.devices.len(), 2);
     }
 
     #[tokio::test]
@@ -812,6 +905,26 @@ mod tests {
         assert!(client.has_device(lid, 1).await);
         // Non-existent device should return false
         assert!(!client.has_device(lid, 99).await);
+    }
+
+    /// has_device must iterate every lookup key: a record keyed under PN is found
+    /// when queried by LID (the fallback key), and vice versa. Guards the
+    /// borrowed-`all_keys()` iteration the churn fix preserves.
+    #[tokio::test]
+    async fn test_has_device_found_via_fallback_lookup_key() {
+        let client = create_test_client().await;
+        let lid = "100000000000009";
+        let pn = "15559998888";
+
+        setup_lid_pn(&client, lid, pn).await;
+        setup_device_record(&client, pn, &[2]).await;
+
+        assert!(
+            client.has_device(lid, 2).await,
+            "device keyed under PN must be found when queried by LID"
+        );
+        assert!(client.has_device(pn, 2).await);
+        assert!(!client.has_device(lid, 77).await);
     }
 
     /// Test that invalidate_device_cache clears registry cache entries for
@@ -986,7 +1099,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("15551234567".to_string(), record)
+            .insert("15551234567".to_string(), Arc::new(record))
             .await;
 
         // Patch: update device 3 key_index to 5
@@ -1288,7 +1401,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("15551234567".into(), record)
+            .insert("15551234567".into(), Arc::new(record))
             .await;
 
         // Warm the sender key device cache
@@ -1541,7 +1654,10 @@ mod tests {
         backend.update_device_list(legacy.clone()).await.unwrap();
         // Warm cache under PN to simulate a reader that populated it before
         // the mapping was learned.
-        client.device_registry_cache.insert(pn.into(), legacy).await;
+        client
+            .device_registry_cache
+            .insert(pn.into(), Arc::new(legacy))
+            .await;
 
         setup_lid_pn(&client, lid, pn).await;
 

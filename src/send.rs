@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use log::debug;
 use wacore::client::context::SendContextResolver;
 use wacore::libsignal::protocol::SignalProtocolError;
+use wacore::send::StanzaType;
 use wacore::types::jid::JidExt;
 use wacore::types::message::AddressingMode;
 #[cfg(test)]
@@ -12,6 +13,26 @@ use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
+
+/// Returns a `GroupInfo` whose participant list is guaranteed to contain our own
+/// sending JID, without deep-cloning the shared (cached) metadata in the common
+/// case where the server's participant list already includes us.
+fn ensure_self_in_group(
+    info: std::sync::Arc<wacore::client::context::GroupInfo>,
+    own_sending_jid: &Jid,
+) -> std::sync::Arc<wacore::client::context::GroupInfo> {
+    if info
+        .participants
+        .iter()
+        .any(|participant| participant.is_same_user_as(own_sending_jid))
+    {
+        info
+    } else {
+        let mut owned = (*info).clone();
+        owned.participants.push(own_sending_jid.to_non_ad());
+        std::sync::Arc::new(owned)
+    }
+}
 
 /// Options for [`Client::send_message_with_options`].
 #[derive(Debug, Clone, Default)]
@@ -25,6 +46,9 @@ pub struct SendOptions {
     /// message (WA Web `EProtoGenerator.js:183` parity).
     /// Common values: 86400 (24h), 604800 (7d), 7776000 (90d).
     pub ephemeral_expiration: Option<u32>,
+    /// Force the `<message type="...">` attribute instead of deriving it from
+    /// content. Escape hatch for a type the classifier can't infer.
+    pub stanza_type_override: Option<StanzaType>,
 }
 
 /// Result of a successfully sent message.
@@ -278,6 +302,78 @@ fn build_revoke_message(
     }
 }
 
+/// A newsletter (channel) admin op on an existing message: edit (with the
+/// replacement body) or revoke. Keeping content tied to the variant makes the
+/// invalid edit-without-body / revoke-with-body states unrepresentable.
+pub(crate) enum NewsletterEdit<'a> {
+    Edit(&'a wa::Message),
+    Revoke,
+}
+
+/// Build a newsletter (channel) plaintext edit/revoke stanza. The target is keyed
+/// by `message_id` (the original message's stanza id string, the wire `id`), NOT
+/// by `server_id`: WA Web (mergeNewsletterClientIDMixin -> `id`) and whatsmeow
+/// (sendNewsletter, req.ID = protocolMessage.key.id) both reference edit/revoke by
+/// the message id and emit no `server_id` (that attr is reaction-only).
+pub(crate) fn build_newsletter_edit_node(
+    to: &Jid,
+    message_id: &str,
+    op: NewsletterEdit<'_>,
+) -> Node {
+    use crate::types::message::EditAttribute;
+    use prost::Message as _;
+    let mut plaintext = NodeBuilder::new("plaintext");
+    let (edit, stanza_type, body) = match op {
+        NewsletterEdit::Edit(m) => {
+            if let Some(mt) = wacore::send::media_type_from_message(m) {
+                plaintext = plaintext.attr("mediatype", mt);
+            }
+            (
+                EditAttribute::AdminEdit,
+                wacore::send::stanza_type_from_message(m),
+                m.encode_to_vec(),
+            )
+        }
+        NewsletterEdit::Revoke => (EditAttribute::AdminRevoke, "text", Vec::new()),
+    };
+    NodeBuilder::new("message")
+        .attr("to", to)
+        .attr("id", message_id)
+        .attr("type", stanza_type)
+        .attr("edit", edit.to_string_val())
+        .children([plaintext.bytes(body).build()])
+        .build()
+}
+
+/// Build a message edit in WA Web's wire shape: a top-level
+/// protocolMessage(type=MESSAGE_EDIT) carrying the new content under
+/// editedMessage, same as build_revoke_message and our own receive path. The
+/// top-level Message.editedMessage FutureProofMessage is the history/storage
+/// form, not what WA Web sends on the wire.
+pub(crate) fn build_edit_message(
+    remote_jid: &Jid,
+    message_id: String,
+    participant: Option<String>,
+    new_content: wa::Message,
+    timestamp_ms: i64,
+) -> wa::Message {
+    wa::Message {
+        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+            key: Some(wa::MessageKey {
+                remote_jid: Some(remote_jid.to_string()),
+                from_me: Some(true),
+                id: Some(message_id),
+                participant,
+            }),
+            r#type: Some(wa::message::protocol_message::Type::MessageEdit as i32),
+            edited_message: Some(Box::new(new_content)),
+            timestamp_ms: Some(timestamp_ms),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
 impl Client {
     /// Send a message to a user, group, or newsletter.
     ///
@@ -293,12 +389,20 @@ impl Client {
     }
 
     /// Send a message with additional options.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn send_message_with_options(
         &self,
         to: Jid,
         mut message: wa::Message,
         options: SendOptions,
     ) -> Result<SendResult, anyhow::Error> {
+        let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
+        wacore::telemetry::send(match to.server {
+            wacore_binary::Server::Group => "group",
+            wacore_binary::Server::Broadcast => "status",
+            wacore_binary::Server::Newsletter => "newsletter",
+            _ => "dm",
+        });
         if let Some(exp) = options.ephemeral_expiration
             && exp > 0
         {
@@ -309,6 +413,7 @@ impl Client {
             }
         }
 
+        let stanza_type_override = options.stanza_type_override;
         let request_id = match options.message_id {
             Some(id) => id,
             None => self.generate_message_id().await,
@@ -323,7 +428,9 @@ impl Client {
         // Matches WA Web's OutMessagePublishNewsletterRequest + ContentType mixins.
         if to.is_newsletter() {
             use prost::Message as _;
-            let stanza_type = wacore::send::stanza_type_from_message(&message);
+            let stanza_type = stanza_type_override
+                .map(StanzaType::as_wire)
+                .unwrap_or_else(|| wacore::send::stanza_type_from_message(&message));
             let (_, meta_node) = infer_stanza_metadata(&message);
             let mut plaintext_builder = NodeBuilder::new("plaintext");
             if let Some(mt) = wacore::send::media_type_from_message(&message) {
@@ -356,6 +463,7 @@ impl Client {
             false,
             edit,
             extra_nodes,
+            stanza_type_override,
         )
         .await?;
         Ok(result)
@@ -370,6 +478,7 @@ impl Client {
     /// `AddressingMode::Lid`; `prepare_group_stanza` signs with `own_lid`
     /// and emits `addressing_mode="lid"` on the stanza. Errors only if no
     /// recipient could be resolved.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.status", level = "debug", skip_all, fields(count = recipients.len()), err(Debug)))]
     pub(crate) async fn send_status_message(
         &self,
         message: wa::Message,
@@ -382,6 +491,10 @@ impl Client {
         if recipients.is_empty() {
             return Err(anyhow!("Cannot send status with no recipients"));
         }
+
+        // Status posts don't go through send_message_with_options, so count them here.
+        let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
+        wacore::telemetry::send("status");
 
         let to = Jid::status_broadcast();
         let request_id = self.generate_message_id().await;
@@ -473,6 +586,18 @@ impl Client {
                 .map(|(_all, needs)| needs)
         };
 
+        // prepare_group_stanza and ensure_status_participants both read the
+        // participant list and expect self present. Done after SKDM resolution
+        // to preserve the prior ordering (resolve ran without self appended).
+        let own_status_base = own_lid.to_non_ad();
+        if !group_info
+            .participants
+            .iter()
+            .any(|participant| participant.is_same_user_as(&own_status_base))
+        {
+            group_info.participants.push(own_status_base);
+        }
+
         // `<meta status_setting>` describes the POSTER's privacy on their own
         // status. Reactions go through WA Web's addon path and never visit
         // `WAWebEncryptAndSendStatusMsg`; attaching the meta on a reaction
@@ -491,7 +616,7 @@ impl Client {
             &*self.runtime,
             &mut stores,
             self,
-            &mut group_info,
+            &group_info,
             &own_jid,
             &own_lid,
             account_info.as_deref(),
@@ -536,7 +661,7 @@ impl Client {
                         &*self.runtime,
                         &mut stores_retry,
                         self,
-                        &mut group_info,
+                        &group_info,
                         &own_jid,
                         &own_lid,
                         account_info.as_deref(),
@@ -608,6 +733,7 @@ impl Client {
     /// For LID mode, uses `group_info.phone_jid_for_lid_user` to query devices
     /// via PN when available (LID usync is unreliable for own JID), then
     /// converts the result back to LID. Same fallback as `prepare_group_stanza`.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
     async fn resolve_skdm_targets(
         &self,
         group_jid: &str,
@@ -660,7 +786,7 @@ impl Client {
                 let all_devices: Vec<Jid> = if is_lid_mode {
                     all_devices
                         .into_iter()
-                        .map(|d| group_info.phone_device_jid_to_lid(&d))
+                        .map(|d| group_info.phone_device_jid_into_lid(d))
                         .collect()
                 } else {
                     all_devices
@@ -786,6 +912,7 @@ impl Client {
     /// Cold path of [`spawn_phash_validation`](Self::spawn_phash_validation): the
     /// server's phash disagreed with ours, so invalidate the relevant
     /// device/group caches and (for groups) force sender-key redistribution.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.phash_mismatch", level = "debug", skip_all, fields(jid = %jid.observe())))]
     async fn handle_phash_mismatch(
         &self,
         jid: &Jid,
@@ -794,7 +921,8 @@ impl Client {
         invalidate_group_cache: bool,
     ) {
         log::warn!(
-            "Phash mismatch for {jid}: ours={our_phash}, server={server_phash}. Invalidating caches."
+            "Phash mismatch for {}: ours={our_phash}, server={server_phash}. Invalidating caches.",
+            jid.observe()
         );
         // DM phash covers both recipient + own devices
         // (WA Web: syncDeviceListJob([recipient, me]))
@@ -862,6 +990,7 @@ impl Client {
     /// * `message_id` - The ID of the message to delete
     /// * `revoke_type` - Use `RevokeType::Sender` to delete your own message,
     ///   or `RevokeType::Admin { original_sender }` to delete another user's message as group admin
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.revoke", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn revoke_message(
         &self,
         to: Jid,
@@ -918,6 +1047,7 @@ impl Client {
             force_skdm,
             Some(edit_attr),
             vec![],
+            None,
         )
         .await
     }
@@ -949,6 +1079,7 @@ impl Client {
         .await
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.pin", level = "debug", skip_all, fields(chat = %chat.observe()), err(Debug)))]
     async fn send_pin(
         &self,
         chat: Jid,
@@ -977,10 +1108,12 @@ impl Client {
             false,
             Some(crate::types::message::EditAttribute::PinInChat),
             vec![],
+            None,
         )
         .await
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_message_impl(
         &self,
@@ -991,7 +1124,20 @@ impl Client {
         force_key_distribution: bool,
         edit: Option<crate::types::message::EditAttribute>,
         extra_stanza_nodes: Vec<Node>,
+        stanza_type_override: Option<StanzaType>,
     ) -> Result<(), anyhow::Error> {
+        // Newsletters are plaintext channels and never use the E2E path. Text
+        // sends go through the <plaintext> branch in send_message_with_options;
+        // edit/revoke have dedicated plaintext methods (newsletter().edit_message
+        // / revoke_message). A newsletter JID here is a mis-routed pin/edit/revoke
+        // (pin is not a channel op), so reject it.
+        if to.is_newsletter() {
+            return Err(anyhow!(
+                "newsletter JIDs are not valid on the E2E send path; use \
+                 newsletter().edit_message/revoke_message (pin is unsupported on channels)"
+            ));
+        }
+
         // status@broadcast reactions fan out pairwise to the author's devices;
         // status posts keep going through send_status_message (owns recipients).
         let (to, is_status_addon) = if to.is_status_broadcast() {
@@ -1069,7 +1215,7 @@ impl Client {
         } else if to.is_group() {
             // No send-level lock: encrypt_group_message serializes the
             // sender-key chain advance per (group, sender) at the cipher.
-            let mut group_info = self.groups().query_info(&to).await?;
+            let group_info = self.groups().query_info(&to).await?;
 
             let mut device_snapshot = self.persistence_manager.get_device_snapshot().await;
             let account_info = device_snapshot.account.take();
@@ -1093,13 +1239,9 @@ impl Client {
                 crate::types::message::AddressingMode::Pn => (own_jid.clone(), "pn"),
             };
 
-            if !group_info
-                .participants
-                .iter()
-                .any(|participant| participant.is_same_user_as(&own_sending_jid))
-            {
-                group_info.participants.push(own_sending_jid.to_non_ad());
-            }
+            // resolve_skdm_targets and prepare_group_stanza both read the
+            // participant list and expect self to be present.
+            let group_info = ensure_self_in_group(group_info, &own_sending_jid);
 
             let force_skdm = {
                 use wacore::libsignal::store::sender_key_name::SenderKeyName;
@@ -1117,15 +1259,20 @@ impl Client {
                 // a chain advances past a threshold. Captured-js doesn't show
                 // the value; 1000 mirrors common Signal hygiene defaults.
                 const SENDER_KEY_ROTATION_THRESHOLD: u32 = 1000;
+                // Read the chain iteration through the shared `Arc` without cloning
+                // the record: borrow the current state instead of `*_mut().cloned()`.
                 let needs_rotation = record
-                    .and_then(|mut r| r.sender_key_state_mut().ok().cloned())
-                    .and_then(|state| state.sender_chain_key().map(|ck| ck.iteration()))
+                    .as_ref()
+                    .and_then(|r| r.sender_key_state().ok())
+                    .and_then(|state| state.sender_chain_key())
+                    .map(|ck| ck.iteration())
                     .is_some_and(|iter| iter >= SENDER_KEY_ROTATION_THRESHOLD);
                 drop(device_guard);
 
                 if needs_rotation {
                     log::info!(
-                        "Periodic sender-key rotation for {to} (chain iteration ≥ {SENDER_KEY_ROTATION_THRESHOLD})"
+                        "Periodic sender-key rotation for {} (chain iteration ≥ {SENDER_KEY_ROTATION_THRESHOLD})",
+                        to.observe()
                     );
                     self.signal_cache
                         .delete_sender_key(sender_key_name.cache_key())
@@ -1171,7 +1318,7 @@ impl Client {
                 &*self.runtime,
                 &mut stores,
                 self,
-                &mut group_info,
+                &group_info,
                 &own_jid,
                 &own_lid,
                 account_info.as_deref(),
@@ -1200,7 +1347,10 @@ impl Client {
                     if let Some(SignalProtocolError::NoSenderKeyState(_)) =
                         e.downcast_ref::<SignalProtocolError>()
                     {
-                        log::warn!("No sender key for group {}, forcing distribution.", to);
+                        log::warn!(
+                            "No sender key for group {}, forcing distribution.",
+                            to.observe()
+                        );
 
                         if let Err(e) = self
                             .persistence_manager
@@ -1219,7 +1369,7 @@ impl Client {
                             &*self.runtime,
                             &mut stores_retry,
                             self,
-                            &mut group_info,
+                            &group_info,
                             &own_jid,
                             &own_lid,
                             account_info.as_deref(),
@@ -1291,7 +1441,10 @@ impl Client {
                         }
                     }
                     Err(e) => {
-                        log::warn!("LID query failed for {}, falling back to PN: {e:?}", to);
+                        log::warn!(
+                            "LID query failed for {}, falling back to PN: {e:?}",
+                            to.observe()
+                        );
                     }
                 }
             }
@@ -1400,7 +1553,7 @@ impl Client {
                 }
             }
             if should_issue_tc_token_after_send {
-                debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to);
+                debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to.observe());
             }
 
             let lock_jids = self.build_session_lock_keys(&all_dm_jids).await;
@@ -1451,6 +1604,9 @@ impl Client {
         let mut stanza_to_send = stanza_to_send;
         if is_status_addon {
             stanza_to_send.attrs.insert("to", Jid::status_broadcast());
+        }
+        if let Some(t) = stanza_type_override {
+            stanza_to_send.attrs.insert("type", t.as_wire());
         }
 
         if let Err(e) = self.send_node(stanza_to_send).await {
@@ -1595,12 +1751,13 @@ impl Client {
     ///
     /// Returns whether we should issue a new tc token after send, and the cache key
     /// of the attached valid tc token when that token should be marked as used.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.maybe_tc_token", level = "debug", skip_all, fields(to = %to.observe())))]
     async fn maybe_include_tc_token(
         &self,
         to: &Jid,
         extra_nodes: &mut Vec<Node>,
     ) -> (bool, Option<String>) {
-        use wacore::iq::props::config_codes;
+        use wacore::iq::abprops::web;
         use wacore::iq::tctoken::{
             build_cs_token_node, build_tc_token_node, compute_cs_token, is_tc_token_expired_with,
             should_send_new_tc_token_with,
@@ -1661,7 +1818,7 @@ impl Client {
         // AB prop gates stanza inclusion only (not issuance scheduling)
         let token_send_enabled = self
             .ab_props
-            .is_enabled_or(config_codes::PRIVACY_TOKEN_ON_ALL_1_ON_1_MESSAGES, false)
+            .is_enabled(web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES)
             .await;
 
         if token_send_enabled {
@@ -1677,7 +1834,7 @@ impl Client {
                     // cstoken fallback — gated by wa_nct_token_send_enabled
                     let nct_send_enabled = self
                         .ab_props
-                        .is_enabled_or(config_codes::NCT_TOKEN_SEND_ENABLED, false)
+                        .is_enabled(web::WA_NCT_TOKEN_SEND_ENABLED)
                         .await;
 
                     if nct_send_enabled
@@ -1690,9 +1847,9 @@ impl Client {
                             wacore_binary::Jid::new(*lid_user, Server::Lid).to_string();
                         let cs_token = compute_cs_token(salt, &recipient_lid);
                         extra_nodes.push(build_cs_token_node(&cs_token));
-                        log::debug!(target: "Client/CsToken", "Attached cstoken for {} (NCT fallback)", to);
+                        log::debug!(target: "Client/CsToken", "Attached cstoken for {} (NCT fallback)", to.observe());
                     } else {
-                        log::debug!(target: "Client/CsToken", "No tctoken or NCT salt/LID available for {}", to);
+                        log::debug!(target: "Client/CsToken", "No tctoken or NCT salt/LID available for {}", to.observe());
                     }
                 }
             }
@@ -1702,6 +1859,7 @@ impl Client {
     }
 
     /// Returns `true` if the issuance IQ succeeded.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.issue_tc_token", level = "debug", skip_all, fields(to = %to.observe())))]
     async fn issue_tc_token_after_send(&self, to: &Jid) -> bool {
         use wacore::iq::tctoken::IssuePrivacyTokensSpec;
 
@@ -1717,7 +1875,7 @@ impl Client {
             )))
             .await
         else {
-            log::debug!(target: "Client/TcToken", "Failed to issue tc_token for {}", issuance_jid);
+            log::debug!(target: "Client/TcToken", "Failed to issue tc_token for {}", issuance_jid.observe());
             return false;
         };
 
@@ -1740,7 +1898,7 @@ impl Client {
         let mut any_stored = false;
         for received in tokens {
             if received.token.is_empty() {
-                log::warn!(target: "Client/TcToken", "Server returned empty tc_token for {}, skipping", received.jid);
+                log::warn!(target: "Client/TcToken", "Server returned empty tc_token for {}, skipping", received.jid.observe());
                 continue;
             }
 
@@ -1815,6 +1973,7 @@ impl Client {
     /// Re-issue tctoken after a contact's device identity changes.
     /// Only re-issues if we previously sent a token (sender_timestamp valid).
     /// Uses session_locks to deduplicate concurrent spawns for the same sender.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.reissue_tc_token", level = "debug", skip_all, fields(sender = %sender.observe())))]
     pub(crate) async fn reissue_tc_token_after_identity_change(&self, sender: &Jid) {
         use wacore::iq::tctoken::{IssuePrivacyTokensSpec, is_sender_tc_token_expired};
 
@@ -1864,14 +2023,14 @@ impl Client {
                 log::debug!(
                     target: "Client/TcToken",
                     "Re-issued tctoken after identity change for {}",
-                    sender
+                    sender.observe()
                 );
             }
             Err(e) => {
                 log::debug!(
                     target: "Client/TcToken",
                     "Failed to re-issue tctoken after identity change for {}: {e}",
-                    sender
+                    sender.observe()
                 );
             }
         }
@@ -1937,32 +2096,14 @@ impl Client {
 
     /// Build tctoken timing config from AB props, falling back to defaults.
     pub(crate) async fn tc_token_config(&self) -> wacore::iq::tctoken::TcTokenConfig {
-        use wacore::iq::props::config_codes;
-        use wacore::iq::tctoken::{TC_TOKEN_BUCKET_DURATION, TC_TOKEN_NUM_BUCKETS, TcTokenConfig};
+        use wacore::iq::abprops::web;
+        use wacore::iq::tctoken::TcTokenConfig;
 
         TcTokenConfig {
-            bucket_duration: self
-                .ab_props
-                .get_int(config_codes::TCTOKEN_DURATION, TC_TOKEN_BUCKET_DURATION)
-                .await,
-            num_buckets: self
-                .ab_props
-                .get_int(config_codes::TCTOKEN_NUM_BUCKETS, TC_TOKEN_NUM_BUCKETS)
-                .await,
-            sender_bucket_duration: self
-                .ab_props
-                .get_int(
-                    config_codes::TCTOKEN_DURATION_SENDER,
-                    TC_TOKEN_BUCKET_DURATION,
-                )
-                .await,
-            sender_num_buckets: self
-                .ab_props
-                .get_int(
-                    config_codes::TCTOKEN_NUM_BUCKETS_SENDER,
-                    TC_TOKEN_NUM_BUCKETS,
-                )
-                .await,
+            bucket_duration: self.ab_props.get_int(web::TCTOKEN_DURATION).await,
+            num_buckets: self.ab_props.get_int(web::TCTOKEN_NUM_BUCKETS).await,
+            sender_bucket_duration: self.ab_props.get_int(web::TCTOKEN_DURATION_SENDER).await,
+            sender_num_buckets: self.ab_props.get_int(web::TCTOKEN_NUM_BUCKETS_SENDER).await,
         }
         .clamped()
     }
@@ -1983,12 +2124,12 @@ impl Client {
     /// Resolve the target JID for privacy token issuance.
     /// Gated by `lid_trusted_token_issue_to_lid` — LID when true, PN when false.
     async fn resolve_issuance_jid(&self, jid: &Jid) -> Jid {
-        use wacore::iq::props::config_codes;
+        use wacore::iq::abprops::web;
 
-        // Default true: issue to LID by default (safer — server accepts both)
+        // Matches the upstream default (false); the server overrides per-account.
         let issue_to_lid = self
             .ab_props
-            .is_enabled_or(config_codes::LID_TRUSTED_TOKEN_ISSUE_TO_LID, true)
+            .is_enabled(web::LID_TRUSTED_TOKEN_ISSUE_TO_LID)
             .await;
 
         let resolved = if issue_to_lid {
@@ -2027,6 +2168,32 @@ pub(crate) fn is_self_dm_recipient(
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn ensure_self_in_group_shares_when_present_and_appends_when_absent() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let own: Jid = "999999999999@s.whatsapp.net".parse().unwrap();
+        let other: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
+
+        // Self already a member (the common case): the shared Arc passes through
+        // untouched, with no deep clone of the participant list.
+        let with_self = std::sync::Arc::new(GroupInfo::new(
+            vec![other.to_non_ad(), own.to_non_ad()],
+            AddressingMode::Pn,
+        ));
+        let out = ensure_self_in_group(with_self.clone(), &own);
+        assert!(std::sync::Arc::ptr_eq(&with_self, &out));
+
+        // Self missing: a fresh GroupInfo is built with self appended.
+        let without_self =
+            std::sync::Arc::new(GroupInfo::new(vec![other.to_non_ad()], AddressingMode::Pn));
+        let out = ensure_self_in_group(without_self.clone(), &own);
+        assert!(!std::sync::Arc::ptr_eq(&without_self, &out));
+        assert_eq!(out.participants.len(), 2);
+        assert!(out.participants.iter().any(|p| p.is_same_user_as(&own)));
+    }
 
     #[tokio::test]
     async fn send_message_to_status_without_reaction_errors() {
@@ -2632,7 +2799,7 @@ mod tests {
             };
             client
                 .device_registry_cache
-                .insert((*user).into(), record)
+                .insert((*user).into(), Arc::new(record))
                 .await;
         }
 
@@ -2947,6 +3114,54 @@ mod tests {
             };
             let (edit, _) = infer_stanza_metadata(&msg);
             assert_eq!(edit, Some(EditAttribute::MessageEdit));
+        }
+
+        #[test]
+        fn build_edit_message_uses_top_level_protocol_message() {
+            use std::str::FromStr;
+            let to = Jid::from_str("5511999999999@s.whatsapp.net").unwrap();
+            let new_content = wa::Message {
+                conversation: Some("edited".to_string()),
+                ..Default::default()
+            };
+            let msg = build_edit_message(
+                &to,
+                "ORIG_ID".to_string(),
+                None,
+                new_content,
+                1_700_000_000_000,
+            );
+
+            // Canonical WA Web shape: top-level protocolMessage(type=MESSAGE_EDIT),
+            // not the Message.editedMessage FutureProofMessage history wrapper.
+            assert!(
+                msg.edited_message.is_none(),
+                "edit must not use the FutureProofMessage wrapper"
+            );
+            let pm = msg
+                .protocol_message
+                .as_deref()
+                .expect("top-level protocol_message");
+            assert_eq!(
+                pm.r#type,
+                Some(wa::message::protocol_message::Type::MessageEdit as i32)
+            );
+            assert_eq!(
+                pm.key.as_ref().and_then(|k| k.id.as_deref()),
+                Some("ORIG_ID")
+            );
+            assert_eq!(pm.key.as_ref().and_then(|k| k.from_me), Some(true));
+            assert_eq!(
+                pm.edited_message
+                    .as_ref()
+                    .and_then(|m| m.conversation.as_deref()),
+                Some("edited")
+            );
+            // The send path still derives the edit attribute from this shape.
+            assert_eq!(
+                infer_stanza_metadata(&msg).0,
+                Some(EditAttribute::MessageEdit)
+            );
         }
     }
 
@@ -3631,6 +3846,7 @@ mod tests {
                 false,
                 None,
                 vec![],
+                None,
             )
             .await;
         assert!(

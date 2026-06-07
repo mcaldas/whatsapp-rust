@@ -192,6 +192,7 @@ fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Ji
 }
 
 impl Client {
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.handle_receipt", level = "debug", skip_all, fields(chat = %receipt.source.chat.observe(), sender = %receipt.source.sender.observe()), err(Debug)))]
     pub(crate) async fn handle_retry_receipt(
         self: &Arc<Self>,
         receipt: &Receipt,
@@ -218,7 +219,10 @@ impl Client {
         if retry_count >= MAX_RETRY_COUNT {
             warn!(
                 "Refusing retry #{} for message {} from {}: exceeds max attempts ({})",
-                retry_count, message_id, receipt.source.sender, MAX_RETRY_COUNT
+                retry_count,
+                message_id,
+                receipt.source.sender.observe(),
+                MAX_RETRY_COUNT
             );
             return Ok(());
         }
@@ -326,7 +330,7 @@ impl Client {
                     log::warn!(
                         "Failed to fetch group info for retry of msg {} in {}: {e}",
                         message_id,
-                        info.chat
+                        info.chat.observe()
                     );
                     None
                 }
@@ -348,7 +352,7 @@ impl Client {
                 log::warn!(
                     "Unknown device {} in group {} — forcing full sender key rotation \
                      (matches WA Web's rotateKey behavior)",
-                    info.requester,
+                    info.requester.observe(),
                     group_jid
                 );
 
@@ -427,7 +431,10 @@ impl Client {
                 .should_recreate_session(retry_count, &resolved_jid)
                 .await
             {
-                info!("Recreating session with {resolved_jid} for retry of {message_id}: {reason}");
+                info!(
+                    "Recreating session with {} for retry of {message_id}: {reason}",
+                    resolved_jid.observe()
+                );
                 self.signal_cache.delete_session(&signal_address).await;
                 drop(guard);
                 self.flush_signal_cache_logged("should_recreate_session", Some(&message_id))
@@ -448,7 +455,9 @@ impl Client {
 
         info!(
             "Resending message {} to {} (retry #{})",
-            message_id, info.chat, retry_count
+            message_id,
+            info.chat.observe(),
+            retry_count
         );
 
         if info.chat.is_group() {
@@ -547,6 +556,7 @@ impl Client {
     /// retry>2 when the base key already changed (session was regenerated
     /// legitimately). The subsequent `ensure_e2e_sessions_resolved` call in
     /// `handle_retry_receipt` rebuilds any session this function deleted.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.update_local_session", level = "debug", skip_all, fields(chat = %info.chat.observe(), peer = %resolved_jid.observe(), retry = retry_count)))]
     async fn update_local_signal_session(
         &self,
         info: &RetryChatInfo,
@@ -573,12 +583,14 @@ impl Client {
                     };
                     info!(
                         "Marked {} for fresh SKDM in {} {} due to retry receipt",
-                        info.requester, chat_type, group_jid
+                        info.requester.observe(),
+                        chat_type,
+                        group_jid
                     );
                 }
                 Err(e) => log::warn!(
                     "Failed to mark sender key forget for {} in {}: {}",
-                    info.requester,
+                    info.requester.observe(),
                     group_jid,
                     e
                 ),
@@ -600,7 +612,7 @@ impl Client {
         if !key_bundle_processed && keys_node_present {
             log::warn!(
                 "Key bundle present but rejected for {}: {:?} — skipping regId mismatch deletion",
-                resolved_jid,
+                resolved_jid.observe(),
                 key_bundle_result.as_ref().err()
             );
         }
@@ -610,7 +622,7 @@ impl Client {
                 // only warn when a regId mismatch triggers a delete below.
                 log::debug!(
                     "No key bundle in retry receipt for {}: {}. Checking for reg ID mismatch.",
-                    resolved_jid,
+                    resolved_jid.observe(),
                     e
                 );
             }
@@ -635,7 +647,9 @@ impl Client {
                     info!(
                         "Registration ID mismatch for {} (stored: {}, received: {}). \
                          Deleting session since no key bundle provided.",
-                        signal_address, stored_reg_id, received_reg_id
+                        wacore::types::jid::observe_protocol_address(&signal_address),
+                        stored_reg_id,
+                        received_reg_id
                     );
                     let lock = self.session_lock_for(signal_address.as_str()).await;
                     let _guard = lock.lock().await;
@@ -676,9 +690,14 @@ impl Client {
             {
                 Ok(()) => info!(
                     "Saved base key for {} at retry #{} for collision detection",
-                    signal_address, retry_count
+                    wacore::types::jid::observe_protocol_address(&signal_address),
+                    retry_count
                 ),
-                Err(e) => warn!("Failed to save base key for {}: {}", signal_address, e),
+                Err(e) => warn!(
+                    "Failed to save base key for {}: {}",
+                    wacore::types::jid::observe_protocol_address(&signal_address),
+                    e
+                ),
             }
             return;
         }
@@ -693,7 +712,8 @@ impl Client {
                     warn!(
                         "Base key collision detected for {} at retry #{}. \
                          Session hasn't been regenerated. Forcing fresh session.",
-                        signal_address, retry_count
+                        wacore::types::jid::observe_protocol_address(&signal_address),
+                        retry_count
                     );
                     let _ = device_guard
                         .backend
@@ -713,7 +733,8 @@ impl Client {
                 Ok(false) => {
                     info!(
                         "Base key changed for {} at retry #{} - session regenerated",
-                        signal_address, retry_count
+                        wacore::types::jid::observe_protocol_address(&signal_address),
+                        retry_count
                     );
                     let _ = device_guard
                         .backend
@@ -721,7 +742,11 @@ impl Client {
                         .await;
                 }
                 Err(e) => {
-                    warn!("Failed to check base key for {}: {}", signal_address, e);
+                    warn!(
+                        "Failed to check base key for {}: {}",
+                        wacore::types::jid::observe_protocol_address(&signal_address),
+                        e
+                    );
                 }
             }
         }
@@ -807,6 +832,7 @@ impl Client {
     /// * `node` - The retry receipt node containing the key bundle
     /// * `requester_jid` - The JID of the device requesting the retry
     /// * `is_peer` - Whether this is a peer device (our own device)
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.process_key_bundle", level = "debug", skip_all, fields(peer = %requester_jid.observe(), is_peer), err(Debug)))]
     async fn process_retry_key_bundle(
         &self,
         node: &NodeRef<'_>,
@@ -928,7 +954,7 @@ impl Client {
 
         let mut adapter = self.signal_adapter().await;
 
-        process_prekey_bundle(
+        let identity_change = process_prekey_bundle(
             &signal_address,
             &mut adapter.session_store,
             &mut adapter.identity_store,
@@ -940,6 +966,10 @@ impl Client {
 
         // Flush after session establishment
         self.flush_signal_cache().await?;
+
+        if identity_change == wacore::libsignal::protocol::IdentityChange::ReplacedExisting {
+            self.react_to_local_identity_change(requester_jid);
+        }
 
         info!(
             "Processed key bundle from retry receipt for {}",
@@ -957,6 +987,7 @@ impl Client {
     ///   know which attempt this is. The sender may use this to decide whether to resend.
     /// * `reason` - The retry reason code (matches WhatsApp Web's RetryReason enum). This helps
     ///   the sender understand why the message couldn't be decrypted.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.send_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), retry = retry_count), err(Debug)))]
     pub(crate) async fn send_retry_receipt(
         &self,
         info: &crate::types::message::MessageInfo,
@@ -965,28 +996,27 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
 
-        // Bot message filtering (matches WhatsApp Web behavior):
-        // Don't send retry receipts to bot accounts from non-bot accounts.
-        // This prevents unnecessary retry traffic to automated systems.
-        let we_are_bot = device_snapshot
-            .pn
-            .as_ref()
-            .map(|our_pn| our_pn.is_bot())
-            .unwrap_or(false);
-        let sender_is_bot = info.source.sender.is_bot();
-
-        if !we_are_bot && sender_is_bot {
+        // WA Web's sendRetryReceipt aborts only when `!to.isBot() && participant.isBot()`,
+        // with participant null for DMs. A bot DM is chat == sender == bot, so it is NOT
+        // suppressed and the retry is sent; only a bot reply in a non-bot group is dropped.
+        // Same helper the ack and self-fanout paths already use.
+        if info.source.is_bot_authored_non_bot_chat() {
             log::debug!(
-                "Skipping retry receipt for message {} from bot {}: bots don't process retries",
+                "Skipping retry receipt for message {} from bot {} in non-bot chat {}",
                 info.id,
-                info.source.sender
+                info.source.sender.observe(),
+                info.source.chat.observe()
             );
             return Ok(());
         }
 
         debug!(
             "Sending retry receipt #{} for message {} in chat {} from {} (reason: {:?})",
-            retry_count, info.id, info.source.chat, info.source.sender, reason
+            retry_count,
+            info.id,
+            info.source.chat.observe(),
+            info.source.sender.observe(),
+            reason
         );
 
         // Build the retry element with the error code (matches WhatsApp Web's format)
@@ -1010,16 +1040,19 @@ impl Client {
             .build();
 
         let keys_node = if wacore::protocol::retry::should_include_keys(retry_count, reason) {
-            let device_store = self.persistence_manager.get_device_arc().await;
-            let device_guard = device_store.read().await;
-
-            let new_prekey_id = (rand::random::<u32>() % 16777215) + 1;
+            // Allocate the one-time prekey from the same monotonic NEXT_PK_ID counter as the
+            // upload path (WA Web's getOrGenSinglePreKey) so it can never overwrite a live pool
+            // key. Hold prekey_upload_lock to serialize the allocate+bump with uploads.
+            let prekey_guard = self.prekey_upload_lock.lock().await;
+            let new_prekey_id = self.allocate_next_one_time_prekey_id().await?;
             let new_prekey_keypair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
             let new_prekey_record = wacore::libsignal::store::record_helpers::new_pre_key_record(
                 new_prekey_id,
                 &new_prekey_keypair,
             );
             // This key is not uploaded to the server pool, so mark as false
+            let device_store = self.persistence_manager.get_device_arc().await;
+            let device_guard = device_store.read().await;
             if let Err(e) = device_guard
                 .store_prekey(new_prekey_id, new_prekey_record, false)
                 .await
@@ -1027,22 +1060,7 @@ impl Client {
                 warn!("Failed to store new prekey for retry receipt: {e:?}");
             }
             drop(device_guard);
-
-            let identity_key_bytes = device_snapshot
-                .identity_key
-                .public_key
-                .public_key_bytes()
-                .to_vec();
-
-            let prekey_value_bytes = new_prekey_keypair.public_key.serialize().to_vec();
-
-            let skey_id = device_snapshot.signed_pre_key_id;
-            let skey_value_bytes = device_snapshot
-                .signed_pre_key
-                .public_key
-                .serialize()
-                .to_vec();
-            let skey_sig_bytes = device_snapshot.signed_pre_key_signature.to_vec();
+            drop(prekey_guard);
 
             let device_identity_bytes = device_snapshot
                 .account
@@ -1050,24 +1068,15 @@ impl Client {
                 .ok_or_else(|| anyhow::anyhow!("Missing device account info for retry receipt"))?
                 .encode_to_vec();
 
-            let type_bytes = vec![5u8];
-
-            Some(
-                NodeBuilder::new("keys")
-                    .children([
-                        NodeBuilder::new("type").bytes(type_bytes).build(),
-                        NodeBuilder::new("identity")
-                            .bytes(identity_key_bytes)
-                            .build(),
-                        OneTimePreKeyNode::new(new_prekey_id, prekey_value_bytes).into_node(),
-                        SignedPreKeyNode::new(skey_id, skey_value_bytes, skey_sig_bytes)
-                            .into_node(),
-                        NodeBuilder::new("device-identity")
-                            .bytes(device_identity_bytes)
-                            .build(),
-                    ])
-                    .build(),
-            )
+            Some(wacore::protocol::retry::build_retry_keys_node(
+                &device_snapshot.identity_key.public_key,
+                new_prekey_id,
+                &new_prekey_keypair.public_key,
+                device_snapshot.signed_pre_key_id,
+                &device_snapshot.signed_pre_key.public_key,
+                device_snapshot.signed_pre_key_signature.to_vec(),
+                device_identity_bytes,
+            ))
         } else {
             None
         };
@@ -1139,6 +1148,7 @@ impl Client {
     /// WA Web reference: `ENC_RETRY_RECEIPT_ATTRS.GROUP_CALL = "enc_rekey_retry"`,
     /// constructed in `WAWebVoipSignalingEnums` module.
     #[allow(dead_code)] // Will be used when call handling is implemented (#345)
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.send_enc_rekey_receipt", level = "debug", skip_all, fields(peer = %peer_jid.observe(), retry = retry_count), err(Debug)))]
     pub(crate) async fn send_enc_rekey_retry_receipt(
         &self,
         stanza_id: &str,
@@ -1171,7 +1181,9 @@ impl Client {
 
         info!(
             "Sending enc_rekey_retry receipt for call-id={} to {} (count={})",
-            call_id, peer_jid, retry_count
+            call_id,
+            peer_jid.observe(),
+            retry_count
         );
 
         self.send_node(receipt_node).await?;

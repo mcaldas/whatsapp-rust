@@ -1,4 +1,12 @@
+// Instrumenting large async fns (e.g. process_sync_task) wraps them in deep
+// `Instrumented` future types; the default depth limit overflows when the
+// `tracing` + `tracing-pii` paths combine. Raise it (compile-time only).
+#![recursion_limit = "512"]
+
+pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
+/// Optional metrics emission (the `metrics` feature). No-op when the feature is off.
+pub use wacore::telemetry;
 pub use wacore::{
     iq::privacy as privacy_settings, proto_helpers, sticker_pack, store::traits, webp,
 };
@@ -48,6 +56,7 @@ pub use runtime_impl::TokioRuntime;
 pub use wacore::runtime::Runtime;
 pub mod send;
 pub use send::{PinDuration, RevokeType, SendOptions, SendResult};
+pub use wacore::send::StanzaType;
 pub mod session;
 pub mod socket;
 pub mod store;
@@ -71,7 +80,7 @@ pub use features::{
     CommunitySubgroup, Contacts, CreateCommunityOptions, CreateCommunityResult, CreateGroupResult,
     EncryptedEdit, GroupCreateOptions, GroupDescription, GroupJoinError, GroupMetadata,
     GroupParticipant, GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType,
-    Groups, GrowthLockInfo, InviteInfoError, IsOnWhatsAppResult, JoinGroupResult,
+    Groups, GrowthLockInfo, InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels,
     LinkSubgroupsResult, MediaRetryResult, MediaReupload, MediaReuploadRequest, MemberAddMode,
     MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, Mex,
     MexError, MexErrorExtensions, MexRequest, MexResponse, Newsletter, NewsletterMessage,

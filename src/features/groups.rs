@@ -1,6 +1,7 @@
 use crate::client::Client;
-use crate::features::mex::{MexError, MexRequest};
+use crate::features::mex::{MexError, mex_request};
 use std::collections::HashMap;
+use std::sync::Arc;
 use wacore::client::context::GroupInfo;
 use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
@@ -13,6 +14,7 @@ use wacore::iq::groups::{
     SetGroupMembershipApprovalIq, SetGroupSubjectIq, SetMemberAddModeIq,
     SetNoFrequentlyForwardedIq, normalize_participants,
 };
+use wacore::iq::mex_operations::update_group_property;
 use wacore::types::message::AddressingMode;
 use wacore_binary::{Jid, JidExt as _};
 
@@ -23,6 +25,31 @@ pub use wacore::iq::groups::{
     MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
     MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
 };
+
+/// Typed `update` payload for the `update_group_property` mex mutation. The
+/// generated mirror types this op's `update` as a `String`, but it is a one-of
+/// object; this enum's `#[serde(rename_all = "snake_case")]` emits the exact
+/// wire keys with no `serde_json::Value`. Leaf values use the mex (uppercase)
+/// vocabulary, which differs from the lower-case `WireEnum` IQ values.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GroupPropertyUpdate {
+    MemberLinkMode(&'static str),
+    MemberShareGroupHistoryMode(&'static str),
+    LimitSharing(LimitSharingUpdate),
+}
+
+#[derive(serde::Serialize)]
+struct LimitSharingUpdate {
+    limit_sharing_enabled: bool,
+    limit_sharing_trigger: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct UpdateGroupPropertyVars {
+    group_id: String,
+    update: GroupPropertyUpdate,
+}
 
 /// Result for a single group in a batch query.
 #[derive(Debug, Clone)]
@@ -187,7 +214,7 @@ impl<'a> Groups<'a> {
         Self { client }
     }
 
-    pub async fn query_info(&self, jid: &Jid) -> Result<GroupInfo, anyhow::Error> {
+    pub async fn query_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, anyhow::Error> {
         if let Some(cached) = self.client.get_group_cache().await.get(jid).await {
             return Ok(cached);
         }
@@ -211,9 +238,9 @@ impl<'a> Groups<'a> {
             .await?
         {
             GroupInfoOutcome::NotModified => {
-                let info = persisted.ok_or_else(|| {
+                let info = Arc::new(persisted.ok_or_else(|| {
                     anyhow::anyhow!("server returned not-modified group but nothing was cached")
-                })?;
+                })?);
                 self.client
                     .get_group_cache()
                     .await
@@ -280,6 +307,7 @@ impl<'a> Groups<'a> {
             Err(e) => log::warn!("Failed to serialize group metadata for {jid}: {e}"),
         }
 
+        let info = Arc::new(info);
         self.client
             .get_group_cache()
             .await
@@ -343,7 +371,7 @@ impl<'a> Groups<'a> {
         if self
             .client
             .ab_props()
-            .is_enabled(wacore::iq::props::config_codes::PRIVACY_TOKEN_ON_GROUP_CREATE)
+            .is_enabled(wacore::iq::abprops::web::PRIVACY_TOKEN_SENDING_ON_GROUP_CREATE)
             .await
         {
             self.attach_tokens_to_participants(&mut options.participants)
@@ -394,7 +422,7 @@ impl<'a> Groups<'a> {
         let iq = if self
             .client
             .ab_props()
-            .is_enabled(wacore::iq::props::config_codes::PRIVACY_TOKEN_ON_GROUP_PARTICIPANT_ADD)
+            .is_enabled(wacore::iq::abprops::web::PRIVACY_TOKEN_SENDING_ON_GROUP_PARTICIPANT_ADD)
             .await
         {
             let options = self.resolve_participant_tokens(participants).await;
@@ -406,14 +434,15 @@ impl<'a> Groups<'a> {
         let result = self.client.execute(iq).await?;
         if result.iter().any(|r| r.is_ok()) {
             let group_cache = self.client.get_group_cache().await;
-            if let Some(mut info) = group_cache.get(jid).await {
+            if let Some(info) = group_cache.get(jid).await {
+                let mut info = Arc::unwrap_or_clone(info);
                 info.add_participants(
                     result
                         .iter()
                         .filter(|r| r.is_ok())
                         .map(|r| (&r.jid, r.phone_number.as_ref())),
                 );
-                group_cache.insert(jid.clone(), info).await;
+                group_cache.insert(jid.clone(), Arc::new(info)).await;
             }
         }
         Ok(result)
@@ -435,9 +464,10 @@ impl<'a> Groups<'a> {
             .collect();
         if !accepted.is_empty() {
             let group_cache = self.client.get_group_cache().await;
-            if let Some(mut info) = group_cache.get(jid).await {
+            if let Some(info) = group_cache.get(jid).await {
+                let mut info = Arc::unwrap_or_clone(info);
                 info.remove_participants(&accepted);
-                group_cache.insert(jid.clone(), info).await;
+                group_cache.insert(jid.clone(), Arc::new(info)).await;
             }
             self.client
                 .rotate_sender_key_on_participant_remove(&jid.to_string(), &accepted)
@@ -651,7 +681,7 @@ impl<'a> Groups<'a> {
             MemberLinkMode::AdminLink => "ADMIN_LINK",
             MemberLinkMode::AllMemberLink => "ALL_MEMBER_LINK",
         };
-        self.mex_update_group_property(jid, serde_json::json!({ "member_link_mode": value }))
+        self.mex_update_group_property(jid, GroupPropertyUpdate::MemberLinkMode(value))
             .await
     }
 
@@ -665,22 +695,17 @@ impl<'a> Groups<'a> {
             MemberShareHistoryMode::AdminShare => "ADMIN_SHARE",
             MemberShareHistoryMode::AllMemberShare => "ALL_MEMBER_SHARE",
         };
-        self.mex_update_group_property(
-            jid,
-            serde_json::json!({ "member_share_group_history_mode": value }),
-        )
-        .await
+        self.mex_update_group_property(jid, GroupPropertyUpdate::MemberShareGroupHistoryMode(value))
+            .await
     }
 
     /// Enable or disable limit sharing in the group (via MEX).
     pub async fn set_limit_sharing(&self, jid: &Jid, enabled: bool) -> Result<(), MexError> {
         self.mex_update_group_property(
             jid,
-            serde_json::json!({
-                "limit_sharing": {
-                    "limit_sharing_enabled": enabled,
-                    "limit_sharing_trigger": "CHAT_SETTING"
-                }
+            GroupPropertyUpdate::LimitSharing(LimitSharingUpdate {
+                limit_sharing_enabled: enabled,
+                limit_sharing_trigger: "CHAT_SETTING",
             }),
         )
         .await
@@ -765,18 +790,18 @@ impl<'a> Groups<'a> {
     async fn mex_update_group_property(
         &self,
         jid: &Jid,
-        update: serde_json::Value,
+        update: GroupPropertyUpdate,
     ) -> Result<(), MexError> {
         let resp = self
             .client
             .mex()
-            .mutate(MexRequest {
-                doc: wacore::iq::mex_ids::groups::UPDATE_GROUP_PROPERTY,
-                variables: serde_json::json!({
-                    "group_id": jid.to_string(),
-                    "update": update,
-                }),
-            })
+            .mutate(mex_request!(
+                update_group_property,
+                UpdateGroupPropertyVars {
+                    group_id: jid.to_string(),
+                    update,
+                }
+            ))
             .await?;
 
         let state = resp
@@ -811,7 +836,16 @@ impl<'a> Groups<'a> {
         }
         let msg = wacore::send::build_member_label_message(label.into(), wacore::time::now_secs());
         self.client
-            .send_message_impl(group_jid.clone(), &msg, None, false, false, None, vec![])
+            .send_message_impl(
+                group_jid.clone(),
+                &msg,
+                None,
+                false,
+                false,
+                None,
+                vec![],
+                None,
+            )
             .await
     }
 
@@ -870,7 +904,7 @@ impl<'a> Groups<'a> {
     async fn only_check_lid(&self) -> bool {
         self.client
             .ab_props()
-            .is_enabled(wacore::iq::props::config_codes::PRIVACY_TOKEN_ONLY_CHECK_LID)
+            .is_enabled(wacore::iq::props::stale::PRIVACY_TOKEN_ONLY_CHECK_LID)
             .await
     }
 
@@ -1072,5 +1106,67 @@ mod tests {
         assert!(extract_invite_code("whatsapp://chat/?code=&other=1").is_none());
     }
 
+    #[tokio::test]
+    async fn warm_group_cache_hit_shares_arc_not_deep_clone() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = crate::test_utils::create_test_client().await;
+        let group_jid: Jid = "123456789@g.us".parse().unwrap();
+
+        let info = GroupInfo::new(
+            vec![
+                "111111111111@s.whatsapp.net".parse().unwrap(),
+                "222222222222@s.whatsapp.net".parse().unwrap(),
+            ],
+            AddressingMode::Pn,
+        );
+        let cache = client.get_group_cache().await;
+        cache.insert(group_jid.clone(), Arc::new(info)).await;
+
+        let a = cache.get(&group_jid).await.expect("warm hit");
+        let b = cache.get(&group_jid).await.expect("warm hit");
+
+        // A warm group-cache hit returns a refcount bump of the same allocation,
+        // not a deep copy of the participant list and LID/PN maps.
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.participants.len(), 2);
+    }
+
     // Protocol-level tests (node building, parsing, validation) are in wacore/src/iq/groups.rs
+
+    #[test]
+    fn group_property_update_serializes_to_wire() {
+        assert_eq!(
+            serde_json::to_value(UpdateGroupPropertyVars {
+                group_id: "123@g.us".to_string(),
+                update: GroupPropertyUpdate::MemberLinkMode("ADMIN_LINK"),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "group_id": "123@g.us",
+                "update": { "member_link_mode": "ADMIN_LINK" }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(GroupPropertyUpdate::MemberShareGroupHistoryMode(
+                "ALL_MEMBER_SHARE"
+            ))
+            .unwrap(),
+            serde_json::json!({ "member_share_group_history_mode": "ALL_MEMBER_SHARE" })
+        );
+        assert_eq!(
+            serde_json::to_value(GroupPropertyUpdate::LimitSharing(LimitSharingUpdate {
+                limit_sharing_enabled: true,
+                limit_sharing_trigger: "CHAT_SETTING",
+            }))
+            .unwrap(),
+            serde_json::json!({
+                "limit_sharing": {
+                    "limit_sharing_enabled": true,
+                    "limit_sharing_trigger": "CHAT_SETTING"
+                }
+            })
+        );
+    }
 }
