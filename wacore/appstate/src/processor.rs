@@ -824,9 +824,9 @@ mod tests {
             );
 
             // The MAC store ends with the index present (delete-then-put), so the
-            // hash above is the only self-consistent answer. The wire blob is the
-            // HMAC of the index identity, recomputed by decode_record.
-            let wire_index_mac = generate_index_mac(&index_mac, &keys.index);
+            // hash above is the only self-consistent answer. At this pin
+            // decode_record stores the wire index blob as-is.
+            let wire_index_mac = index_mac.clone();
             assert_eq!(result.added_macs.len(), 1, "{label}");
             assert_eq!(result.added_macs[0].index_mac, wire_index_mac, "{label}");
             assert_eq!(result.added_macs[0].value_mac, set_tail, "{label}");
