@@ -140,7 +140,19 @@ mod tests {
                 .get(&(name.to_string(), index_mac.to_vec()))
                 .cloned())
         }
-        async fn delete_mutation_macs(&self, _: &str, _: &[Vec<u8>]) -> StoreResult<()> {
+        async fn delete_mutation_macs(
+            &self,
+            name: &str,
+            index_macs: &[Vec<u8>],
+        ) -> StoreResult<()> {
+            let mut macs = self.macs.lock().await;
+            for im in index_macs {
+                macs.remove(&(name.to_string(), im.clone()));
+            }
+            Ok(())
+        }
+        async fn clear_mutation_macs(&self, name: &str) -> StoreResult<()> {
+            self.macs.lock().await.retain(|(n, _), _| n != name);
             Ok(())
         }
         async fn get_latest_sync_key_id(&self) -> StoreResult<Option<Vec<u8>>> {
@@ -438,6 +450,316 @@ mod tests {
         assert_eq!(
             final_state.version, 2,
             "The version should be updated to that of the patch."
+        );
+    }
+
+    /// ALF-436 fixture: a processor over a mock backend holding the sync key, plus
+    /// a snapshot at v5 holding index X whose MAC is valid for a fresh baseline.
+    struct DivergenceFixture {
+        backend: Arc<MockBackend>,
+        processor: AppStateProcessor,
+        keys: wacore::appstate::keys::ExpandedAppStateKeys,
+        key_id: Vec<u8>,
+        snapshot: wa::SyncdSnapshot,
+        snapshot_state: HashState,
+    }
+
+    const NAME: WAPatchName = WAPatchName::CriticalUnblockLow;
+
+    fn plaintext(ts: i64) -> Vec<u8> {
+        wa::SyncActionData {
+            value: Some(wa::SyncActionValue {
+                timestamp: Some(ts),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    fn value_mac_of(m: &wa::SyncdMutation) -> Vec<u8> {
+        let blob = m
+            .record
+            .as_ref()
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap()
+            .blob
+            .as_ref()
+            .unwrap();
+        blob[blob.len() - 32..].to_vec()
+    }
+
+    async fn divergence_fixture() -> DivergenceFixture {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let x = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[1; 32],
+            &plaintext(1000),
+            &keys,
+            &key_id,
+        );
+        let mut snapshot_state = HashState {
+            version: 5,
+            ..Default::default()
+        };
+        snapshot_state.update_hash_from_records(std::slice::from_ref(x.record.as_ref().unwrap()));
+        let snapshot = wa::SyncdSnapshot {
+            version: Some(wa::SyncdVersion { version: Some(5) }),
+            records: vec![x.record.unwrap()],
+            mac: Some(snapshot_state.generate_snapshot_mac(NAME.as_str(), &keys.snapshot_mac)),
+            key_id: Some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+        DivergenceFixture {
+            backend,
+            processor,
+            keys,
+            key_id,
+            snapshot,
+            snapshot_state,
+        }
+    }
+
+    /// A v6 patch SETting `mutation`, with snapshot/patch MACs the server would
+    /// send: computed from the true post-patch ltHash (nothing to subtract).
+    fn patch_v6(f: &DivergenceFixture, mutation: wa::SyncdMutation) -> wa::SyncdPatch {
+        let mut server_state = f.snapshot_state.clone();
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(
+            &mut server_state.hash,
+            &[] as &[Vec<u8>],
+            &[value_mac_of(&mutation)],
+        );
+        server_state.version = 6;
+        let mut patch = wa::SyncdPatch {
+            version: Some(wa::SyncdVersion { version: Some(6) }),
+            mutations: vec![mutation],
+            snapshot_mac: Some(
+                server_state.generate_snapshot_mac(NAME.as_str(), &f.keys.snapshot_mac),
+            ),
+            key_id: Some(wa::KeyId {
+                id: Some(f.key_id.clone()),
+            }),
+            ..Default::default()
+        };
+        patch.patch_mac = Some(wacore::appstate::hash::generate_patch_mac(
+            &patch,
+            NAME.as_str(),
+            &f.keys.patch_mac,
+            6,
+        ));
+        patch
+    }
+
+    /// Stale mutation MACs + a valid snapshot. At pin 39f5ec5e the snapshot left the
+    /// stale row for Y in place, the v6 SET of Y subtracted it, and the whole sync
+    /// failed with PatchSnapshotMACMismatch (prod: "patch snapshot MAC mismatch").
+    /// The snapshot is a fresh baseline, so the stale row must go and v6 must apply.
+    #[tokio::test]
+    async fn snapshot_clears_stale_mutation_macs_so_next_patch_validates() {
+        let f = divergence_fixture().await;
+        let y_index = vec![2u8; 32];
+        f.backend
+            .put_mutation_macs(
+                NAME.as_str(),
+                3,
+                &[AppStateMutationMAC {
+                    index_mac: y_index.clone(),
+                    value_mac: vec![0xAB; 32],
+                }],
+            )
+            .await
+            .unwrap();
+        let set_y = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &y_index,
+            &plaintext(2000),
+            &f.keys,
+            &f.key_id,
+        );
+        let pl = PatchList {
+            name: NAME,
+            has_more_patches: false,
+            patches: vec![patch_v6(&f, set_y.clone())],
+            snapshot: Some(f.snapshot.clone()),
+            snapshot_ref: None,
+            error: None,
+        };
+
+        let (mutations, state, _) = f
+            .processor
+            .process_patch_list(pl, true)
+            .await
+            .expect("a fresh snapshot must not inherit stale MACs");
+
+        assert_eq!(mutations.len(), 2, "snapshot X + patch Y");
+        assert_eq!(state.version, 6);
+        assert_eq!(
+            f.backend
+                .get_mutation_mac(NAME.as_str(), &y_index)
+                .await
+                .unwrap(),
+            Some(value_mac_of(&set_y)),
+            "Y's stored MAC is the patch's, not the stale one"
+        );
+    }
+
+    /// A patch that does not reproduce the server's ltHash after a MAC-valid snapshot
+    /// must not discard the snapshot's mutations (the contact names in prod): keep
+    /// them, stay at the snapshot version, and stop paging.
+    #[tokio::test]
+    async fn diverged_patch_after_snapshot_keeps_snapshot_mutations() {
+        let f = divergence_fixture().await;
+        let set_y = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[2; 32],
+            &plaintext(2000),
+            &f.keys,
+            &f.key_id,
+        );
+        let mut bad = patch_v6(&f, set_y);
+        bad.snapshot_mac = Some(vec![0; 32]);
+        let pl = PatchList {
+            name: NAME,
+            has_more_patches: true,
+            patches: vec![bad],
+            snapshot: Some(f.snapshot.clone()),
+            snapshot_ref: None,
+            error: None,
+        };
+
+        let (mutations, state, list) = f.processor.process_patch_list(pl, true).await.unwrap();
+
+        assert_eq!(mutations.len(), 1, "the snapshot's mutation survives");
+        assert_eq!(state.version, 5);
+        assert_eq!(
+            f.backend.get_version(NAME.as_str()).await.unwrap().version,
+            5
+        );
+        assert!(
+            !list.has_more_patches,
+            "paging would re-fetch the failing patch"
+        );
+    }
+
+    /// Without a snapshot in the same response the divergence still surfaces as a
+    /// typed error, which is what the client's recovery keys on.
+    #[tokio::test]
+    async fn diverged_patch_without_snapshot_is_a_typed_divergence() {
+        let f = divergence_fixture().await;
+        f.backend
+            .set_version(NAME.as_str(), f.snapshot_state.clone())
+            .await
+            .unwrap();
+        let set_y = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[2; 32],
+            &plaintext(2000),
+            &f.keys,
+            &f.key_id,
+        );
+        let mut bad = patch_v6(&f, set_y);
+        bad.snapshot_mac = Some(vec![0; 32]);
+        let pl = PatchList {
+            name: NAME,
+            has_more_patches: false,
+            patches: vec![bad],
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+
+        let err = f.processor.process_patch_list(pl, true).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<wacore::appstate::AppStateError>()
+                .is_some_and(|e| e.is_divergence()),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_diverged_collection_zeroes_one_collection_once_per_interval() {
+        let f = divergence_fixture().await;
+        let mac = |i: u8| AppStateMutationMAC {
+            index_mac: vec![i; 32],
+            value_mac: vec![i; 32],
+        };
+        for (name, i) in [(NAME, 1u8), (WAPatchName::Regular, 2u8)] {
+            f.backend
+                .set_version(name.as_str(), f.snapshot_state.clone())
+                .await
+                .unwrap();
+            f.backend
+                .put_mutation_macs(name.as_str(), 5, &[mac(i)])
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            f.processor
+                .reset_diverged_collection(NAME.as_str())
+                .await
+                .unwrap()
+        );
+        let state = f.backend.get_version(NAME.as_str()).await.unwrap();
+        assert_eq!((state.version, state.hash), (0, [0u8; 128]));
+        assert!(
+            f.backend
+                .get_mutation_mac(NAME.as_str(), &[1; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The other collection is untouched.
+        assert_eq!(
+            f.backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .unwrap()
+                .version,
+            5
+        );
+        assert!(
+            f.backend
+                .get_mutation_mac(WAPatchName::Regular.as_str(), &[2; 32])
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Second reset inside the interval is refused and touches nothing.
+        f.backend
+            .set_version(NAME.as_str(), f.snapshot_state.clone())
+            .await
+            .unwrap();
+        assert!(
+            !f.processor
+                .reset_diverged_collection(NAME.as_str())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            f.backend.get_version(NAME.as_str()).await.unwrap().version,
+            5
         );
     }
 }

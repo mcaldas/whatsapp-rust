@@ -34,4 +34,18 @@ pub enum AppStateError {
     PatchVersionMismatch { expected: u64, got: u64 },
 }
 
+impl AppStateError {
+    /// The local collection no longer matches the server's (a version gap or an
+    /// ltHash that does not reproduce the server's MAC). Patching cannot fix
+    /// this; only a fresh snapshot can.
+    pub fn is_divergence(&self) -> bool {
+        matches!(
+            self,
+            Self::PatchVersionMismatch { .. }
+                | Self::PatchSnapshotMACMismatch
+                | Self::PatchMACMismatch
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, AppStateError>;

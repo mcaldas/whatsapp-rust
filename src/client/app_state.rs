@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// True when `e` says the collection diverged from the server (see
+/// [`wacore::appstate::AppStateError::is_divergence`]).
+fn is_divergence(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<wacore::appstate::AppStateError>()
+        .is_some_and(|e| e.is_divergence())
+}
+
 impl Client {
     pub(crate) async fn get_app_state_processor(&self) -> Arc<AppStateProcessor> {
         let mut guard = self.app_state_processor.lock().await;
@@ -173,6 +180,7 @@ impl Client {
         use wacore::appstate::patch_decode::CollectionSyncError;
         const MAX_ITERATIONS: usize = 5;
         let mut iteration = 0;
+        let mut first_err: Option<anyhow::Error> = None;
 
         while !pending.is_empty() && iteration < MAX_ITERATIONS {
             iteration += 1;
@@ -282,13 +290,29 @@ impl Client {
                 }
             };
 
-            // Process the already-parsed collections (no re-parse of the response).
+            // Process the already-parsed collections (no re-parse of the response),
+            // one at a time so a diverged collection cannot fail the others.
             let proc = self.get_app_state_processor().await;
-            let results = proc
-                .process_patch_lists(patch_lists, &download, true)
-                .await?;
-
+            let mut results = Vec::with_capacity(patch_lists.len());
             let mut needs_refetch = Vec::new();
+            for pl in patch_lists {
+                let name = pl.name;
+                match proc.process_patch_lists(vec![pl], &download, true).await {
+                    Ok(mut r) => results.append(&mut r),
+                    Err(e)
+                        if is_divergence(&e)
+                            && proc.reset_diverged_collection(name.as_str()).await? =>
+                    {
+                        // Version is now 0, so the next iteration asks for a snapshot.
+                        warn!(target: "Client/AppState", "Collection {:?} diverged ({e}); reset to v0, re-requesting a snapshot", name);
+                        needs_refetch.push(name);
+                    }
+                    Err(e) => {
+                        warn!(target: "Client/AppState", "Batched sync: {:?} failed: {e}", name);
+                        first_err.get_or_insert(e);
+                    }
+                }
+            }
 
             for (mutations, new_state, list) in results {
                 let name = list.name;
@@ -368,7 +392,7 @@ impl Client {
             );
         }
 
-        Ok(())
+        first_err.map_or(Ok(()), Err)
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync", level = "debug", skip_all, fields(name = ?name, full_sync = full_sync), err(Debug)))]
@@ -506,8 +530,23 @@ impl Client {
             };
 
             let proc = self.get_app_state_processor().await;
-            let (mutations, new_state, list) =
-                proc.process_parsed_patch_list(pl, &download, true).await?;
+            let (mutations, new_state, list) = match proc
+                .process_parsed_patch_list(pl, &download, true)
+                .await
+            {
+                Ok(r) => r,
+                Err(e)
+                    if is_divergence(&e)
+                        && proc.reset_diverged_collection(name.as_str()).await? =>
+                {
+                    warn!(target: "Client/AppState", "Collection {:?} diverged ({e}); reset to v0, re-requesting a snapshot", name);
+                    state = backend.get_version(name.as_str()).await?;
+                    want_snapshot = true;
+                    full_sync = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let decode_elapsed = _decode_start.elapsed();
             if decode_elapsed.as_millis() > 500 {
                 debug!(target: "Client/AppState", "Patch decode for {:?} took {:?}", name, decode_elapsed);

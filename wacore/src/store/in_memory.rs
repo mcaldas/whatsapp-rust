@@ -342,6 +342,15 @@ impl AppSyncStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
+        self.state
+            .lock()
+            .await
+            .mutation_macs
+            .retain(|(n, _), _| n != name);
+        Ok(())
+    }
+
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>> {
         Ok(self.state.lock().await.latest_sync_key_id.clone())
     }
