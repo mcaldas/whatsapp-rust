@@ -711,7 +711,15 @@ mod tests {
             .set_version(NAME.as_str(), f.snapshot_state.clone())
             .await
             .unwrap();
-        assert!(!f.processor.reset_diverged_collection(NAME.as_str()).await.unwrap());
-        assert_eq!(f.backend.get_version(NAME.as_str()).await.unwrap().version, 5);
+        assert!(
+            !f.processor
+                .reset_diverged_collection(NAME.as_str())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            f.backend.get_version(NAME.as_str()).await.unwrap().version,
+            5
+        );
     }
 }

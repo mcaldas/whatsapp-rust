@@ -530,21 +530,23 @@ impl Client {
             };
 
             let proc = self.get_app_state_processor().await;
-            let (mutations, new_state, list) =
-                match proc.process_parsed_patch_list(pl, &download, true).await {
-                    Ok(r) => r,
-                    Err(e)
-                        if is_divergence(&e)
-                            && proc.reset_diverged_collection(name.as_str()).await? =>
-                    {
-                        warn!(target: "Client/AppState", "Collection {:?} diverged ({e}); reset to v0, re-requesting a snapshot", name);
-                        state = backend.get_version(name.as_str()).await?;
-                        want_snapshot = true;
-                        full_sync = true;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
+            let (mutations, new_state, list) = match proc
+                .process_parsed_patch_list(pl, &download, true)
+                .await
+            {
+                Ok(r) => r,
+                Err(e)
+                    if is_divergence(&e)
+                        && proc.reset_diverged_collection(name.as_str()).await? =>
+                {
+                    warn!(target: "Client/AppState", "Collection {:?} diverged ({e}); reset to v0, re-requesting a snapshot", name);
+                    state = backend.get_version(name.as_str()).await?;
+                    want_snapshot = true;
+                    full_sync = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let decode_elapsed = _decode_start.elapsed();
             if decode_elapsed.as_millis() > 500 {
                 debug!(target: "Client/AppState", "Patch decode for {:?} took {:?}", name, decode_elapsed);
