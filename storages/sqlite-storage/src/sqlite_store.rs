@@ -1935,6 +1935,24 @@ impl AppSyncStore for SqliteStore {
             .await
     }
 
+    async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
+        let device_id = self.device_id;
+        let name = name.to_string();
+        self.with_retry("clear_mutation_macs", || {
+            let name = name.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::delete(
+                    app_state_mutation_macs::table
+                        .filter(app_state_mutation_macs::name.eq(&name))
+                        .filter(app_state_mutation_macs::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>> {
         self.get_latest_app_state_sync_key_id_for_device(self.device_id)
             .await

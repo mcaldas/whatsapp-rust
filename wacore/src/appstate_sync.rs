@@ -88,11 +88,16 @@ pub enum AppStateSyncError {
     Other(#[from] anyhow::Error),
 }
 
+/// Minimum gap between two divergence resets of the same collection, so one
+/// whose fresh snapshot still fails cannot loop snapshot downloads.
+pub const DIVERGENCE_RESET_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 #[derive(Clone)]
 pub struct AppStateProcessor {
     pub backend: Arc<dyn Backend>,
     pub runtime: Arc<dyn crate::runtime::Runtime>,
     key_cache: Arc<Mutex<HashMap<String, Arc<ExpandedAppStateKeys>>>>,
+    last_divergence_reset: Arc<Mutex<HashMap<String, crate::time::Instant>>>,
 }
 
 impl AppStateProcessor {
@@ -101,7 +106,29 @@ impl AppStateProcessor {
             runtime,
             backend,
             key_cache: Arc::new(Mutex::new(HashMap::new())),
+            last_divergence_reset: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Drop a diverged collection back to version 0 (zero ltHash, no mutation MACs)
+    /// so the next sync asks for a snapshot. Returns false, touching nothing, if
+    /// this collection was already reset within [`DIVERGENCE_RESET_INTERVAL`].
+    pub async fn reset_diverged_collection(&self, name: &str) -> Result<bool> {
+        {
+            let mut stamps = self.last_divergence_reset.lock().await;
+            if stamps
+                .get(name)
+                .is_some_and(|t| t.elapsed() < DIVERGENCE_RESET_INTERVAL)
+            {
+                return Ok(false);
+            }
+            stamps.insert(name.to_string(), crate::time::Instant::now());
+        }
+        // MACs first: if the version write fails the collection still asks for
+        // a snapshot next time instead of patching on top of an empty MAC store.
+        self.backend.clear_mutation_macs(name).await?;
+        self.backend.set_version(name, HashState::default()).await?;
+        Ok(true)
     }
 
     pub async fn get_app_state_key(
@@ -247,7 +274,7 @@ impl AppStateProcessor {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_list", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_patch_list(
         &self,
-        pl: PatchList,
+        mut pl: PatchList,
         validate_macs: bool,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         // Pre-fetch all keys we'll need
@@ -275,18 +302,17 @@ impl AppStateProcessor {
                 )?;
                 Ok::<_, crate::appstate::AppStateError>((result, snapshot_state))
             })
-            .await
-            .map_err(|e| anyhow!("{}", e))?;
+            .await?;
 
             let (snapshot_result, snapshot_state) = result;
             state = snapshot_state;
 
             new_mutations.extend(snapshot_result.mutations);
 
-            // Persist state and MACs
-            self.backend
-                .set_version(collection_name, state.clone())
-                .await?;
+            // A snapshot is a fresh baseline: wipe the collection's old MACs first,
+            // or a leftover entry gets subtracted from a later patch's ltHash.
+            // Version LAST, so a failed clear/put is retried rather than skipped.
+            self.backend.clear_mutation_macs(collection_name).await?;
             if !snapshot_result.mutation_macs.is_empty() {
                 self.backend
                     .put_mutation_macs(
@@ -296,6 +322,9 @@ impl AppStateProcessor {
                     )
                     .await?;
             }
+            self.backend
+                .set_version(collection_name, state.clone())
+                .await?;
         }
 
         // Snapshot the key cache once for all patches (prefetch_keys already populated it)
@@ -303,6 +332,7 @@ impl AppStateProcessor {
         let collection_name_owned = collection_name.to_string();
 
         // Process patches
+        let mut stopped_at_divergence = false;
         for patch in &pl.patches {
             // Collect index MACs we need to look up (pre-allocate with upper bound)
             let mut need_db_lookup: Vec<Vec<u8>> = Vec::with_capacity(patch.mutations.len());
@@ -346,8 +376,27 @@ impl AppStateProcessor {
                     &coll,
                 )
             })
-            .await
-            .map_err(|e| anyhow!("{}", e))?;
+            .await;
+            let result = match result {
+                Ok(r) => r,
+                // The snapshot above passed its MAC, so its mutations are genuine even
+                // though this patch does not reproduce the server's ltHash. Keep them
+                // (and the persisted state at the last good version) instead of
+                // throwing the whole baseline away; the next incremental sync hits the
+                // same patch and goes through the caller's divergence recovery.
+                Err(e) if pl.snapshot.is_some() && e.is_divergence() => {
+                    let v = patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
+                    log::warn!(
+                        target: "AppState",
+                        "{collection_name}: patch v{v} failed after a fresh snapshot ({e}); keeping {} mutations at v{}",
+                        new_mutations.len(),
+                        state.version
+                    );
+                    stopped_at_divergence = true;
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             // Update local state with the result from the blocking task
             state = result.state;
@@ -368,6 +417,11 @@ impl AppStateProcessor {
                     .put_mutation_macs(collection_name, state.version, &result.added_macs)
                     .await?;
             }
+        }
+
+        if stopped_at_divergence {
+            // Paging further would only re-fetch the patch that just failed.
+            pl.has_more_patches = false;
         }
 
         // Handle case where we only have a snapshot and no patches
