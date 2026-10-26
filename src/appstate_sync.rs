@@ -140,7 +140,11 @@ mod tests {
                 .get(&(name.to_string(), index_mac.to_vec()))
                 .cloned())
         }
-        async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> StoreResult<()> {
+        async fn delete_mutation_macs(
+            &self,
+            name: &str,
+            index_macs: &[Vec<u8>],
+        ) -> StoreResult<()> {
             let mut macs = self.macs.lock().await;
             for im in index_macs {
                 macs.remove(&(name.to_string(), im.clone()));
@@ -474,7 +478,16 @@ mod tests {
     }
 
     fn value_mac_of(m: &wa::SyncdMutation) -> Vec<u8> {
-        let blob = m.record.as_ref().unwrap().value.as_ref().unwrap().blob.as_ref().unwrap();
+        let blob = m
+            .record
+            .as_ref()
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap()
+            .blob
+            .as_ref()
+            .unwrap();
         blob[blob.len() - 32..].to_vec()
     }
 
@@ -601,7 +614,10 @@ mod tests {
         assert_eq!(mutations.len(), 2, "snapshot X + patch Y");
         assert_eq!(state.version, 6);
         assert_eq!(
-            f.backend.get_mutation_mac(NAME.as_str(), &y_index).await.unwrap(),
+            f.backend
+                .get_mutation_mac(NAME.as_str(), &y_index)
+                .await
+                .unwrap(),
             Some(value_mac_of(&set_y)),
             "Y's stored MAC is the patch's, not the stale one"
         );
@@ -635,8 +651,14 @@ mod tests {
 
         assert_eq!(mutations.len(), 1, "the snapshot's mutation survives");
         assert_eq!(state.version, 5);
-        assert_eq!(f.backend.get_version(NAME.as_str()).await.unwrap().version, 5);
-        assert!(!list.has_more_patches, "paging would re-fetch the failing patch");
+        assert_eq!(
+            f.backend.get_version(NAME.as_str()).await.unwrap().version,
+            5
+        );
+        assert!(
+            !list.has_more_patches,
+            "paging would re-fetch the failing patch"
+        );
     }
 
     /// Without a snapshot in the same response the divergence still surfaces as a
@@ -686,16 +708,34 @@ mod tests {
                 .set_version(name.as_str(), f.snapshot_state.clone())
                 .await
                 .unwrap();
-            f.backend.put_mutation_macs(name.as_str(), 5, &[mac(i)]).await.unwrap();
+            f.backend
+                .put_mutation_macs(name.as_str(), 5, &[mac(i)])
+                .await
+                .unwrap();
         }
 
-        assert!(f.processor.reset_diverged_collection(NAME.as_str()).await.unwrap());
+        assert!(
+            f.processor
+                .reset_diverged_collection(NAME.as_str())
+                .await
+                .unwrap()
+        );
         let state = f.backend.get_version(NAME.as_str()).await.unwrap();
         assert_eq!((state.version, state.hash), (0, [0u8; 128]));
-        assert!(f.backend.get_mutation_mac(NAME.as_str(), &[1; 32]).await.unwrap().is_none());
+        assert!(
+            f.backend
+                .get_mutation_mac(NAME.as_str(), &[1; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
         // The other collection is untouched.
         assert_eq!(
-            f.backend.get_version(WAPatchName::Regular.as_str()).await.unwrap().version,
+            f.backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .unwrap()
+                .version,
             5
         );
         assert!(
